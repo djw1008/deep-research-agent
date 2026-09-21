@@ -11,6 +11,19 @@ license = {text = "MIT"}
 authors = [
     {name = "djw1008"}
 ]
+dependencies = [
+    "openai>=1.0",
+    "httpx>=0.25",
+    "requests>=2.31",
+    "aiosqlite>=0.19",
+    "numpy>=1.24",
+    "sentence-transformers>=3.0",
+    "pydantic>=2.0",
+    "pyyaml>=6.0",
+    "beautifulsoup4>=4.12",
+    "jieba>=0.42",
+    "json-repair>=0.60",
+]
 
 [project.optional-dependencies]
 dev = [
@@ -21,6 +34,10 @@ dev = [
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
 
 [tool.ruff]
 line-length = 100

@@ -26,6 +26,17 @@ Thumbs.db
 
 # Data
 data/
+outputs/
 *.db
 *.sqlite3
 logs/
+
+# Frontend artifacts
+dashboard/node_modules/
+dashboard/.vinext/
+dashboard/dist/
+dashboard/.wrangler/
+
+# Local tooling
+tmp/
+.claude/

@@ -1,0 +1,229 @@
+# =============================================================================
+# DeepResearchAgent 全局默认配置文件
+# =============================================================================
+# 本文件定义了系统的全局参数、模型接口、各模块开关及超参数。
+# 子模块可以通过加载此文件并覆盖特定键来实现自定义配置。
+# =============================================================================
+
+system:
+  # 系统名称与版本号
+  name: "DeepResearchAgent"
+  version: "0.1.0"
+  # 日志级别: DEBUG / INFO / WARNING / ERROR
+  log_level: "INFO"
+  # 工作目录，用于存放临时文件与输出报告
+  work_dir: "./outputs"
+
+model:
+  # ---------------------------------------------------------------------------
+  # 多后端 LLM 配置
+  # ---------------------------------------------------------------------------
+  # 后端选择策略:
+  #   - "deepseek"  : 使用 DeepSeek API（需配置 .env 中的 DEEPSEEK_API_KEY）
+  #   - "vllm"      : 使用本地 vLLM 服务（默认 http://localhost:8000/v1）
+  #   - "openai"    : 使用 OpenAI API（需配置 .env 中的 OPENAI_API_KEY）
+  #   - "auto"      : 自动检测，优先使用已配置 API Key 的远程后端
+  #
+  # 所有敏感信息（API Key、URL）均从 .env / .env.local 读取，
+  # 修改此 YAML 即可切换后端，无需改动源码。
+  # ---------------------------------------------------------------------------
+  backend: "deepseek"          # 默认后端名称
+
+  # 以下为向后兼容的显式配置（优先级低于 .env）。
+  # 推荐做法：在 .env 中配置，此处留空或注释掉。
+  # base_model: "Qwen/Qwen2.5-7B-Instruct"
+  # base_url: "http://localhost:8000/v1"
+  # api_key: "EMPTY"
+
+  # 通用采样参数（可被 .env 中对应后端的参数覆盖）
+  temperature: 0.7
+  top_p: 1.0
+  max_tokens: 4096
+  max_retries: 3
+  retry_delay: 2.0
+
+  # ---------------------------------------------------------------------------
+  # 【唯一入口】模块级采样参数管理
+  # ---------------------------------------------------------------------------
+  # 设计原则：
+  #   - 生成结构化输出（JSON / DAG）→ temperature 低（0.1-0.3）
+  #   - 评分 / 攻击 / 修复 → temperature 极低（0.1），确保一致性
+  #   - 研究 / 合成 → temperature 中等（0.5-0.7），保留一定创造性
+  #   - 摘要 / 压缩 → temperature 低（0.1），不需要创造性
+  #
+  # ⚠️ 重要：所有模块的采样参数（temperature / max_tokens / top_p）
+  #     仅此一处定义，Agent YAML 中不再重复。
+  #     避免 configs/agents/*.yaml 与此处不一致导致的配置漂移。
+  # ---------------------------------------------------------------------------
+  backend_sampling:
+    # DeepSeek 后端的全局默认采样参数
+    deepseek:
+      temperature: 0.7
+      max_tokens: 4096
+      top_p: 1.0
+
+    # MiMo 后端的全局默认采样参数
+    mimo:
+      temperature: 0.3
+      max_tokens: 4096
+      top_p: 1.0
+
+    # Kimi (Moonshot) 后端的全局默认采样参数
+    kimi:
+      temperature: 0.3
+      max_tokens: 4096
+      top_p: 1.0
+
+    # 模块级覆盖（优先级高于后端全局默认）
+    # 格式: 模块名 -> {temperature, max_tokens, top_p}
+    modules:
+      planner:
+        temperature: 0.3       # 生成 JSON DAG 需要确定性
+        max_tokens: 4096
+      solver:
+        temperature: 0.7       # 研究需要一定创造性
+        max_tokens: 4096
+      summarizer:
+        temperature: 0.5       # 合成报告：流畅但不发散
+        max_tokens: 8192       # DeepSeek 上限，约 12000-15000 中文字符
+      red_agent:
+        temperature: 0.1       # 攻击必须严谨，几乎不需要随机性
+        max_tokens: 4096
+      blue_agent:
+        temperature: 0.3       # 修复需要确定性
+        max_tokens: 8192       # 要输出完整修改后的报告，需要更大 token
+      issue_arbiter:
+        temperature: 0.1       # issue 仲裁必须严格，避免误判
+        max_tokens: 4096
+      judge:
+        temperature: 0.1       # 评分标准必须一致，避免漂移
+        max_tokens: 2048
+      compressor:
+        temperature: 0.1       # 摘要是结构化任务
+        max_tokens: 2048
+
+  # ---------------------------------------------------------------------------
+  # 后端分工映射（哪个模块用哪个后端）
+  # ---------------------------------------------------------------------------
+  backend_mapping:
+    # 若留空，所有模块均使用上面的 default backend
+    solver: "deepseek"        # 主研究 Agent：DeepSeek Flash（强推理）
+    planner: "deepseek"       # 规划器：DeepSeek Flash
+    summarizer: "deepseek"    # 合成器：DeepSeek Flash
+    judge: "mimo"            # 评分器：Xiaomi MiMo 2.5 Pro
+    red_agent: "deepseek"    # 对抗攻击：DeepSeek
+    blue_agent: "deepseek"    # 对抗修复：DeepSeek
+    issue_arbiter: "deepseek" # issue 仲裁：DeepSeek
+    compressor: "mimo"        # 上下文压缩：MiMo（摘要任务成本低）
+
+orchestrator:
+  # M1: Multi-Agent Orchestrator 配置
+  # 同时运行的最大子 Agent 数量
+  max_concurrent: 5
+  # 全局超时时间（秒），超过则强制终止整个研究流程。
+  # 设为 null 可关闭全局超时，让流程一直跑到结束。
+  global_timeout_seconds: null
+  # 最大重规划（replan）轮数，防止无限循环
+  max_replan_rounds: 3
+  # 单次规划最多拆分的子问题数量
+  max_sub_questions: 10
+  # 子 Agent 执行失败后的最大重试次数
+  max_subagent_retries: 2
+
+planner:
+  # M2: Adaptive Planner 配置
+  # 每个子 Agent 最多允许的搜索/执行轮数
+  max_search_rounds_per_subagent: 5
+  # 是否启用动态计划调整（replan）
+  enable_replan: true
+  # 计划执行完成后是否自动进行完整性检查
+  enable_completeness_check: true
+
+researcher:
+  # 模型不再调用工具时仍立即结束；以下只控制可用预算。
+  max_llm_turns: 8
+  max_total_tool_calls: 8
+  max_web_search_calls: 3
+  max_browser_calls: 4
+  max_browser_urls_per_round: 3
+  # Planner 给出的超时低于该值时，由 Orchestrator 提升到该下限。
+  subtask_timeout_seconds: 360
+
+compressor:
+  # M3: Context Compressor 配置
+  # 压缩前允许的最大上下文长度（token 数）
+  max_context_length: 16000
+  # 为输出保留的 token 预算（避免压缩后无法生成回答）
+  output_reserve_tokens: 2048
+  # L1 文章级：最大保留篇数与单篇截断长度
+  l1_max_items: 5
+  l1_max_length: 3000
+  # L2 段落级：句子最小保留长度（字符数）
+  l2_min_para_length: 20
+  # Browser 正文先完整进入 L2，再对压缩结果执行最终安全截断
+  browser_post_l2_max_chars: 8000
+
+memory:
+  # Session Memory: per-session research rounds (query + DAG + report)
+  session_db_path: "data/session_memory.db"
+  # Knowledge Base: cross-session reusable sub-task outputs
+  knowledge_db_path: "data/knowledge_base.db"
+  # 去重相似度阈值：高于此值视为重复知识，不重复写入
+  similarity_threshold_dup: 0.92
+  # 子任务执行前召回记忆配置（仅 search 类型，工具调用多、省 token 最明显）
+  recall_before_research:
+    enabled: true
+    top_k: 1
+    threshold: 0.75
+
+adversarial:
+  # M5: Red-Blue Adversarial Loop 配置
+  # 总开关：是否启用对抗降噪流程
+  enabled: false
+  # Red-Blue 对抗最大轮数
+  max_rounds: 5
+  # 报告整体质量分阈值（Red 五维加权评分），达到此分即可提前终止对抗
+  score_threshold: 9.0
+  # 对抗入口置信度阈值：合成报告 confidence >= 此值时认为已经足够好，跳过对抗修复；否则进入对抗修复
+  # 注意：confidence 是 0-1 之间的数，0.8 表示 80% 置信度
+  entry_confidence_threshold: 0.8
+  # 相邻两轮评分差异阈值，低于此值视为收敛，提前终止
+  delta_threshold: 0.2
+  # 是否启用 issue 震荡检测：完全相同的问题重复出现时提前终止
+  enable_oscillation_check: true
+  # Blue 修复时过滤问题的最小严重程度：critical | major | minor
+  min_severity_to_fix: "major"
+  # 每个维度最多保留多少个 issue 进入 Blue 修复，控制 token 消耗
+  max_issues_per_dimension: 3
+  # 单步（Red 单维度攻击 / Blue 单维度修复）最大等待时间（秒）
+  # 设为 null 表示不限制单步时间
+  per_step_timeout_seconds: null
+  # 是否保存每轮对抗日志
+  # 注意：采样参数已移至 model.backend_sampling.modules，此处不再使用
+  save_logs: true
+  # IssueMerger 是否启用 LLM 二次仲裁
+  issue_arbiter:
+    enabled: true
+
+tools:
+  # 工具模块全局配置
+  web_search:
+    enabled: true
+    # mock_mode: 无真实搜索 API 时返回模拟结果，用于快速调试
+    mock_mode: false
+    # 单次搜索返回的最大结果数
+    max_results: 10
+    # 搜索结果摘要最大 token 数
+    snippet_max_tokens: 512
+  arxiv_reader:
+    enabled: true
+    # 单次 ArXiv 查询最多获取的论文数
+    max_papers: 5
+    # 论文摘要最大 token 数
+    abstract_max_tokens: 1024
+  code_sandbox:
+    enabled: false
+    # 代码执行超时（秒）
+    timeout_seconds: 30
+    # 允许的最大内存（MB）
+    memory_limit_mb: 512

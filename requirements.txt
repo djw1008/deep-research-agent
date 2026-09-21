@@ -1,16 +1,29 @@
 # LLM Backends
 openai>=1.0
 httpx>=0.25
+requests>=2.31
 
 # Async & Concurrency
-asyncio-contextmanager>=0.1
+aiosqlite>=0.19
 
 # Vector & Embedding
 numpy>=1.24
-sqlite3-api>=0.1
+sentence-transformers>=3.0
 
 # Data
 pydantic>=2.0
 
+# Chinese tokenization for keyword recall
+jieba>=0.42
+
 # Config
 pyyaml>=6.0
+
+# HTML parsing (Bing fallback)
+beautifulsoup4>=4.12
+
+# JSON repair for LLM malformed outputs
+json-repair>=0.60
+
+# RAGAS evaluation framework
+ragas>=0.2
