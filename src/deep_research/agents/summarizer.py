@@ -124,37 +124,67 @@ class SummarizerAgent(BaseAgent):
             "1. 使用 Markdown 格式，明确引用来源。\n"
             "2. 报告正文必须至少 3000 个中文字符（或 2000 个英文单词）。\n"
             "3. 结构：执行摘要 → 背景 → 关键发现（附细节）→ 分析 → 比较 → 影响 → 结论。\n"
-            "4. 解决来源之间的矛盾。\n"
+            "4. 静默解决来源之间的矛盾：直接输出最终结论；数据有分歧时在行内标注"
+            "（如「84.1–89.0，来源存在分歧」或「存疑」），不要描述解决过程。\n"
             "5. 明确列出所有引用的来源。\n"
             "6. 【强制】报告最末尾必须单独写一行：Overall Confidence: 0.XX（0-1 之间的数字）。不可省略。\n"
-            "</format>"
+            "</format>\n\n"
+            "<audience>\n"
+            "报告面向最终读者，读者看不到也不关心你的内部工作过程。严禁在报告中出现：\n"
+            "- 任何内部编号或标签：「材料 N」「Result N」「子任务」「验证任务」「task_」等；\n"
+            "- 任何关于你如何整合、核对、处理矛盾的章节或段落（如「来源矛盾的解决」「处理方式」）；\n"
+            "- 任何「本报告采用……标注」之类的元叙述。\n"
+            "矛盾的结论必须直接体现在正文措辞里（区间、存疑标注、弱化表述），而不是单独解释。\n"
+            "</audience>"
         )
 
     def _build_synthesis_prompt(self, query: str, results: list[AgentResult]) -> str:
-        """构建合成 prompt，按置信度降序排列结果。"""
+        """构建合成 prompt，按置信度降序排列结果。
+
+        内容完全相同的子结果只保留一份（Planner 可能拆出重复任务），
+        避免模型把重复确认误读为多方独立佐证，或在报告中解释重复现象。
+        """
         sorted_results = sorted(results, key=lambda r: r.confidence, reverse=True)
+
+        def _output_text(r: AgentResult) -> str:
+            return r.output if isinstance(r.output, str) else json.dumps(r.output, ensure_ascii=False, default=str)
+
+        seen_outputs: dict[str, int] = {}
+        unique_results: list[AgentResult] = []
+        duplicate_of: dict[int, int] = {}
+        for r in sorted_results:
+            key = re.sub(r"\s+", "", _output_text(r))
+            if key in seen_outputs:
+                duplicate_of[id(r)] = seen_outputs[key]
+                continue
+            seen_outputs[key] = len(unique_results) + 1
+            unique_results.append(r)
+        dup_counts: dict[int, int] = {}
+        for target in duplicate_of.values():
+            dup_counts[target] = dup_counts.get(target, 0) + 1
 
         parts = [
             f"# Research Question\n{query}\n",
-            f"# Sub-task Results ({len(results)} total)\n",
+            f"# 研究材料（共 {len(unique_results)} 份）\n",
         ]
-        for i, r in enumerate(sorted_results, 1):
+        for i, r in enumerate(unique_results, 1):
             status_icon = "✓" if r.status == AgentStatus.SUCCESS else "✗"
-            output_text = r.output if isinstance(r.output, str) else json.dumps(r.output, ensure_ascii=False, default=str)
+            dup_note = f"（另有 {dup_counts[i]} 份材料内容与此完全相同，视为同一来源的重复确认）\n" if dup_counts.get(i) else ""
             parts.append(
-                f"## Result {i} [{status_icon}] (confidence: {r.confidence:.2f})\n"
-                f"Task: {r.task_id}\n"
-                f"Output:\n{output_text}\n"
+                f"## 材料 {i} [{status_icon}] (confidence: {r.confidence:.2f})\n"
+                f"{dup_note}"
+                f"内容：\n{_output_text(r)}\n"
             )
 
         parts.append(
             "\n# Instructions\n"
-            "1. 【强制】报告最末尾必须单独写一行：Overall Confidence: 0.XX（根据子任务置信度和信息完整度给出一个0-1之间的数字，不要省略）。这一行必须在报告正文全部结束后另起一行单独出现。\n"
-            "2. 直接基于上述发现撰写综合报告，不要说'我将进行合成'。\n"
+            "1. 【强制】报告最末尾必须单独写一行：Overall Confidence: 0.XX（根据材料置信度和信息完整度给出一个0-1之间的数字，不要省略）。这一行必须在报告正文全部结束后另起一行单独出现。\n"
+            "2. 直接基于上述材料撰写综合报告，不要说'我将进行合成'。\n"
             "3. 报告必须全面且详细（至少 3000 中文字符或 2000 英文单词）。\n"
             "4. 结构：执行摘要 → 背景 → 关键发现（附细节）→ 分析 → 比较 → 影响 → 结论。\n"
-            "5. 解决来源之间的矛盾。\n"
-            "6. 明确列出所有引用的来源。"
+            "5. 静默解决材料之间的矛盾：直接输出最终结论，数据有分歧时在行内标注（如「存疑」「来源存在分歧」），不要描述解决过程，不要为矛盾单设章节。\n"
+            "6. 严禁在报告中引用内部标签（「材料 N」「Result N」「子任务」「验证任务」等），也不要提及材料的数量、重复情况或你的整合方式。\n"
+            "7. 明确列出所有引用的来源（写真实 URL 和标题）。"
         )
         return "\n".join(parts)
 
@@ -216,6 +246,14 @@ class SummarizerAgent(BaseAgent):
         # 3. 综合置信度 = LLM 自评 × 成功率开根（降低成功率的影响权重）
         confidence = llm_confidence * (success_rate ** 0.5)
         confidence = round(max(0.0, min(1.0, confidence)), 2)
+
+        # 置信度行只是给程序解析用的，剥离后再交付给用户
+        content = re.sub(
+            r"(?:\n|^)\s*(?:#+\s*)?(?:Overall\s+Confidence|(?:整体|总体|综合)?置信度)\s*[：:][^\n]*\s*$",
+            "",
+            content,
+            flags=re.IGNORECASE,
+        ).rstrip()
 
         # 收集来源（从各个子结果的轨迹中提取）
         sources: list[dict] = []

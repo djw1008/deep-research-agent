@@ -25,6 +25,7 @@ from .schema import (
 )
 from .issue_merger import IssueMerger
 from .workflow import InvalidTransitionError, NoHandlerRegisteredError, StateTransition, TRANSITIONS
+from ..observability import _safe as _json_safe
 
 logger = logging.getLogger(__name__)
 
@@ -172,6 +173,64 @@ class Orchestrator:
             "token_usage": result.token_usage,
             "output": result.output,
             "metadata": result.metadata,
+        })
+
+    def _emit_merge_summary(
+        self,
+        round_no: int,
+        red_result: "RedAttackResult",
+        all_issues: list,
+        merged_issues: list,
+        fix_type_groups: dict,
+    ) -> None:
+        """Emit a synthetic per-round merge node so the dashboard timeline shows
+        the structured attack aggregate and how issues are dispatched to Blue."""
+        task_id = f"merge_round_{round_no}"
+        dimension_scores = {
+            d.value: da.dimension_score
+            for d, da in red_result.dimension_attacks.items()
+        }
+        dispatch = {ft.value: len(group) for ft, group in fix_type_groups.items()}
+        summary = {
+            "round_no": round_no,
+            "overall_score": red_result.overall_score,
+            "dimension_scores": dimension_scores,
+            "issues_before_merge": len(all_issues),
+            "issues_after_merge": len(merged_issues),
+            "fix_type_dispatch": dispatch,
+        }
+        self._emit("task_started", {
+            "task_id": task_id,
+            "task_type": "merge",
+            "description": f"第 {round_no} 轮攻击结果汇总与分发",
+            "dependencies": [f"red_{round_no}_{d.value}" for d in AttackDimension],
+        })
+        self._emit("agent_loop_event", {
+            "task_id": task_id,
+            "event": {
+                "role": "assistant",
+                "content": (
+                    f"第 {round_no} 轮汇总：加权总评分 {red_result.overall_score:.2f}/10；"
+                    f"原始 issue {len(all_issues)} 个，合并去重后 {len(merged_issues)} 个；"
+                    f"按修复类型分发给 Blue：{dispatch if dispatch else '无需修复'}"
+                ),
+            },
+        })
+        self._emit("agent_loop_event", {
+            "task_id": task_id,
+            "event": {
+                "role": "tool",
+                "name": "issue_merger",
+                "result": {**summary, "merged_issues": merged_issues},
+            },
+        })
+        self._emit("task_completed", {
+            "task_id": task_id,
+            "status": "success",
+            "confidence": red_result.overall_score / 10.0,
+            "token_usage": 0,
+            "output": summary,
+            "metadata": {},
         })
 
     # ------------------------------------------------------------------
@@ -509,7 +568,7 @@ class Orchestrator:
                 "confidence": r.confidence,
                 "token_usage": r.token_usage,
                 "output": r.output if isinstance(r.output, str) else str(r.output)[:500],
-                "trajectory": r.trajectory,
+                "trajectory": _json_safe(r.trajectory),
                 "metadata": meta,
             }
             file_path = out_dir / f"{r.task_id}.json"
@@ -681,8 +740,9 @@ class Orchestrator:
         min_severity = Severity(str(cfg.get("min_severity_to_fix", "major")).lower())
 
         # 入口条件：合成报告置信度已足够高时，无需再进入对抗修复
+        # （用户显式触发对抗升级时通过 _force_adversarial 绕过该判断）
         report_confidence = float(getattr(report, "confidence", 0.0))
-        if report_confidence >= entry_confidence_threshold:
+        if report_confidence >= entry_confidence_threshold and not getattr(self, "_force_adversarial", False):
             logger.info(
                 "报告置信度 %.2f 已达到入口阈值 %.2f，跳过对抗优化",
                 report_confidence,
@@ -743,7 +803,15 @@ class Orchestrator:
                 ]
                 all_issues.extend(issues)
 
-            # 2. 合并去重 + 冲突仲裁（可选 LLM 二次仲裁），再按 fix_type 分组批量修复
+            # 2. 汇总本轮攻击：加权评分 + 合并去重 + 冲突仲裁，再按 fix_type 分发修复
+            red_result = RedAttackResult(
+                round_no=round_no,
+                dimension_attacks=dimension_attacks,
+            )
+            overall_score = red_result.compute_overall_score()
+            red_result.overall_score = overall_score
+            red_result.overall_summary = self._build_red_summary(dimension_attacks)
+
             round_blue_fixes: list[dict] = []
             round_blue_new_issues: list[dict] = []
             if all_issues:
@@ -759,12 +827,19 @@ class Orchestrator:
                     len(all_issues),
                     len(merged_issues),
                 )
+            else:
+                merged_issues = []
+                logger.info("第 %d 轮 - 无突出问题，跳过修复", round_no)
 
-                # 按 fix_type 分组
-                fix_type_groups: dict[FixType, list[Issue]] = defaultdict(list)
-                for issue in merged_issues:
-                    fix_type_groups[issue.fix_type].append(issue)
+            # 按 fix_type 分组
+            fix_type_groups: dict[FixType, list[Issue]] = defaultdict(list)
+            for issue in merged_issues:
+                fix_type_groups[issue.fix_type].append(issue)
 
+            # 汇总节点：让时间线能看到结构化攻击结果与分发去向
+            self._emit_merge_summary(round_no, red_result, all_issues, merged_issues, fix_type_groups)
+
+            if merged_issues:
                 # 按 fix_type 保守程度排序：先删除，再补来源，最后改措辞
                 fix_type_order = {FixType.REMOVAL: 0, FixType.SEARCH: 1, FixType.IN_PLACE: 2}
                 for fix_type in sorted(fix_type_groups.keys(), key=lambda ft: fix_type_order.get(ft, 99)):
@@ -781,21 +856,13 @@ class Orchestrator:
                         return WorkflowState.FAILED
 
                     report = blue_result.output
-                    if blue_result.trajectory:
-                        traj = blue_result.trajectory[0]
-                        round_blue_fixes.extend(traj.get("fixes", []))
-                        round_blue_new_issues.extend(traj.get("self_verify_new_issues", []))
-            else:
-                logger.info("第 %d 轮 - 无突出问题，跳过修复", round_no)
+                    if blue_result.metadata:
+                        round_blue_fixes.extend(blue_result.metadata.get("fixes", []))
+                        round_blue_new_issues.extend(
+                            blue_result.metadata.get("self_verify_new_issues", [])
+                        )
 
-            # 3. 用权重算法得到本轮整体评分（无 Judge LLM）
-            red_result = RedAttackResult(
-                round_no=round_no,
-                dimension_attacks=dimension_attacks,
-            )
-            overall_score = red_result.compute_overall_score()
-            red_result.overall_score = overall_score
-            red_result.overall_summary = self._build_red_summary(dimension_attacks)
+            # 3. 汇总本轮突出问题（评分已在第 2 步计算）
 
             outstanding = red_result.outstanding_issues(min_severity)
             current_issue_dicts = [
@@ -902,6 +969,27 @@ class Orchestrator:
                 logger.exception("保存对抗日志失败")
 
         return WorkflowState.DONE
+
+    async def run_adversarial_upgrade(
+        self,
+        report: ResearchReport,
+        session_id: str | None = None,
+    ) -> ResearchReport:
+        """只对已有报告执行 Red/Blue 对抗优化，不重新跑研究链路。
+
+        供 `run.py --upgrade-adversarial` 使用：调用方负责从 report.md 重建
+        ResearchReport 并注入 event_sink。`_do_adversarial` 依赖的实例属性
+        （_report/_query/_session_id/_results）在此设置为安全值；其余属性
+        沿用 __init__ 默认值即可（_dag/_task_map/_round/_context 不参与对抗流程）。
+        """
+        self._report = report
+        self._query = report.query
+        self._session_id = session_id or f"upgrade-{uuid.uuid4().hex[:12]}"
+        self._results = []
+        self._context = ResearchContext(topic=report.query, enable_adversarial=True)
+        self._force_adversarial = True  # 绕过 _do_adversarial 的高置信度入口跳过
+        await self._do_adversarial()
+        return self._report
 
     async def _do_replanning(self) -> WorkflowState:
         """REPLANNING：调用 Planner 增量重规划。"""

@@ -306,7 +306,17 @@ class RedTeamAgent(BaseAgent):
                     task_id=task.id,
                     status=AgentStatus.SUCCESS,
                     output=attack,
-                    trajectory=[{"round": round_no, "dimension": dimension.value}],
+                    trajectory=[
+                        {
+                            "role": "assistant",
+                            "content": (
+                                f"第 {round_no} 轮 · {dimension.value} 维度攻击完成："
+                                f"评分 {attack.dimension_score:.1f}/10，"
+                                f"发现 {len(attack.issues)} 个问题。\n\n{attack.analysis_summary}"
+                            ),
+                        },
+                        {"role": "tool", "name": "dimension_attack", "result": attack},
+                    ],
                     token_usage=len(str(attack)) // 6,
                     confidence=attack.dimension_score / 10.0,
                 )
@@ -333,7 +343,16 @@ class RedTeamAgent(BaseAgent):
                 task_id=task.id,
                 status=AgentStatus.SUCCESS,
                 output=red_result,
-                trajectory=[{"round": round_no, "dimensions": [d.value for d in dimension_attacks.keys()]}],
+                trajectory=[
+                    {
+                        "role": "assistant",
+                        "content": (
+                            f"第 {round_no} 轮全维度攻击完成："
+                            f"综合评分 {red_result.overall_score:.2f}/10。\n\n{red_result.overall_summary}"
+                        ),
+                    },
+                    {"role": "tool", "name": "red_attack", "result": red_result},
+                ],
                 token_usage=token_usage,
                 confidence=red_result.overall_score / 10.0,
             )
@@ -344,7 +363,7 @@ class RedTeamAgent(BaseAgent):
                 task_id=task.id,
                 status=AgentStatus.FAILED,
                 output=f"Red attack failed: {type(e).__name__}: {e}",
-                trajectory=[{"error": str(e)}],
+                trajectory=[{"role": "assistant", "content": f"攻击失败：{type(e).__name__}: {e}"}],
                 token_usage=0,
                 confidence=0.0,
             )

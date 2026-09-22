@@ -2,11 +2,12 @@
 
 import {
   Activity, AlertTriangle, ArrowRight, Braces, Check, ChevronDown,
-  ChevronRight, CircleDot, Clock3, Database, GitBranch, Globe2,
+  ChevronLeft, ChevronRight, CircleDot, Clock3, Database, GitBranch, Globe2,
   MessageSquareText, Pause, Play, RotateCcw, Search, Sparkles,
   TerminalSquare, Wrench, Zap,
 } from 'lucide-react';
-import { useEffect, useMemo, useState } from 'react';
+import Link from 'next/link';
+import { useEffect, useMemo, useRef, useState } from 'react';
 
 type NodeStatus = 'success' | 'running' | 'waiting' | 'failed';
 type AgentNode = { id: string; label: string; type: string; status: NodeStatus; confidence?: number; tokens?: number; duration?: string; dependencies: string[]; x: number; y: number };
@@ -128,14 +129,14 @@ function DagGraph({ graphNodes, selected, onSelect }: { graphNodes: AgentNode[];
   };
   const visibleEdges=edges.filter(edge=>!hasAlternatePath(edge));
   const width=Math.max(980,...graphNodes.map(node=>node.x+290));
-  const height=Math.max(590,...graphNodes.map(node=>node.y+145));
+  const height=Math.max(590,...graphNodes.map(node=>node.y+170));
   const layers=[...new Set(graphNodes.map(node=>node.x))].sort((a,b)=>a-b);
   return <div className="dag-scroll"><div className="dag-stage" style={{width,height}}>
     <svg className="dag-lines" viewBox={`0 0 ${width} ${height}`}><defs><marker id="dag-arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,0 L8,4 L0,8 Z" /></marker></defs>
-      {visibleEdges.map(edge=>{const source=map[edge.from],target=map[edge.to];const x1=source.x+230,y1=source.y+43,x2=target.x-8,y2=target.y+43,mid=x1+(x2-x1)/2;const related=selected===edge.from||selected===edge.to;return <path className={`${related?'edge-related':''} ${selected&&!related?'edge-muted':''}`} key={`${edge.from}-${edge.to}`} d={`M${x1},${y1} C${mid},${y1} ${mid},${y2} ${x2},${y2}`} markerEnd="url(#dag-arrow)"/>})}
+      {visibleEdges.map(edge=>{const source=map[edge.from],target=map[edge.to];const x1=source.x+230,y1=source.y+50,x2=target.x-8,y2=target.y+50,mid=x1+(x2-x1)/2;const related=selected===edge.from||selected===edge.to;return <path className={`${related?'edge-related':''} ${selected&&!related?'edge-muted':''}`} key={`${edge.from}-${edge.to}`} d={`M${x1},${y1} C${mid},${y1} ${mid},${y2} ${x2},${y2}`} markerEnd="url(#dag-arrow)"/>})}
     </svg>
     {layers.map((x,index)=><div className="layer-label" style={{left:x}} key={x}>LAYER {String(index+1).padStart(2,'0')}</div>)}
-    {graphNodes.map((n) => <button key={n.id} className={`dag-node node-${n.status} ${selected === n.id ? 'selected' : ''}`} style={{ left: n.x, top: n.y }} onClick={() => onSelect(n.id)}>
+    {graphNodes.map((n) => <button key={n.id} title={n.label} className={`dag-node node-${n.status} ${selected === n.id ? 'selected' : ''}`} style={{ left: n.x, top: n.y }} onClick={() => onSelect(n.id)}>
       <div className="node-topline"><span className="node-id">{n.id}</span><StatusDot status={n.status} /></div><strong>{n.label}</strong>
       <div className="node-meta"><span>{n.type}</span>{n.confidence !== undefined && <span>{Math.round(n.confidence * 100)}%</span>}<span>{n.duration}</span></div>{n.status === 'running' && <span className="node-progress"><i /></span>}
     </button>)}
@@ -208,7 +209,7 @@ function LoopPanel({ node, liveSteps, query, allNodes, outputs, onSelect, runId 
   const [open, setOpen] = useState<number[]>([1,2,3]); const steps = liveSteps || []; const turns = [...new Set(steps.map((s) => s.turn))];
   const icons = { thought: MessageSquareText, tool: Wrench, result: Braces, error: AlertTriangle };
   return <div className="loop-panel">
-    <div className="detail-heading"><div><span className="eyebrow">AGENT INSPECTOR</span><h2>{node.id} / {node.label}</h2></div><StatusDot status={node.status}/></div>
+    <div className="detail-heading"><div><h2>{node.id} / {node.label}</h2></div><StatusDot status={node.status}/></div>
     <div className="detail-stats"><span><Clock3/> {node.duration || '—'}</span><span><Zap/> {(node.tokens || 0).toLocaleString()} tok</span><span><CircleDot/> {node.confidence ? `${Math.round(node.confidence*100)}%` : '—'}</span></div>
     <InputContext node={node} query={query} allNodes={allNodes} outputs={outputs} onSelect={onSelect}/>
     <TaskResultPanel node={node} result={outputs[node.id]}/>
@@ -250,6 +251,38 @@ export default function Home() {
   const [selected,setSelected] = useState('task_1'); const [tab,setTab] = useState<'dag'|'timeline'|'payload'>('dag'); const [paused,setPaused] = useState(false);
   const [serverRuns,setServerRuns] = useState<RunSummary[]>([]); const [detail,setDetail] = useState<RunDetail|null>(null); const [apiOnline,setApiOnline] = useState(false);
   const [showCreate,setShowCreate] = useState(false); const [newQuery,setNewQuery] = useState(''); const [startError,setStartError] = useState(''); const [starting,setStarting] = useState(false);
+  const [inspectorWidth,setInspectorWidth] = useState<number>(396);
+  const [inspectorCollapsed,setInspectorCollapsed] = useState<boolean>(false);
+  // localStorage 只能在挂载后读取，否则 SSR HTML 与客户端首次渲染不一致（hydration mismatch）
+  const prefsHydrated = useRef(false);
+
+  useEffect(() => {
+    const saved = Number(window.localStorage.getItem('dr-inspector-width'));
+    // 挂载后恢复用户偏好是必须的 setState，react-compiler 的 EffectSetState 在此不适用
+    // eslint-disable-next-line react-compiler/react-compiler
+    if (Number.isFinite(saved) && saved >= 300 && saved <= 760) setInspectorWidth(saved);
+    // eslint-disable-next-line react-compiler/react-compiler
+    if (window.localStorage.getItem('dr-inspector-collapsed') === '1') setInspectorCollapsed(true);
+    prefsHydrated.current = true;
+  }, []);
+
+  useEffect(() => { if (prefsHydrated.current) window.localStorage.setItem('dr-inspector-width', String(inspectorWidth)); }, [inspectorWidth]);
+  useEffect(() => { if (prefsHydrated.current) window.localStorage.setItem('dr-inspector-collapsed', inspectorCollapsed ? '1' : '0'); }, [inspectorCollapsed]);
+
+  function startInspectorResize(event: React.MouseEvent) {
+    event.preventDefault();
+    const startX = event.clientX;
+    const startWidth = inspectorWidth;
+    document.body.classList.add('resizing-inspector');
+    const onMove = (move: MouseEvent) => setInspectorWidth(Math.min(760, Math.max(300, startWidth + (startX - move.clientX))));
+    const onUp = () => {
+      document.body.classList.remove('resizing-inspector');
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+    };
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+  }
   const graphNodes = useMemo<AgentNode[]>(() => (Array.isArray(detail?.nodes) ? detail.nodes : []).map((n) => ({...n, dependencies:Array.isArray(n.dependencies)?n.dependencies:[], duration:'—', x:60+n.layer*350, y:48+n.row*130})), [detail]);
   const node = useMemo(() => graphNodes.find((n) => n.id === selected) || graphNodes[0], [selected,graphNodes]);
   const liveSteps = useMemo<LoopStep[]|undefined>(() => {
@@ -262,23 +295,23 @@ export default function Home() {
     async function refresh(){
       if(paused)return;
       try{
-        const listResponse=await fetch('http://127.0.0.1:8765/api/runs');
+        const listResponse=await fetch('/api/runs');
         if(!listResponse.ok)throw new Error(`Runs API ${listResponse.status}`);
         const listRaw=await listResponse.json();const list=Array.isArray(listRaw)?listRaw as RunSummary[]:[];
         if(!active)return; setApiOnline(true); setServerRuns(list);
         const target=detail?.id||list[0]?.id;
-        if(target){const response=await fetch(`http://127.0.0.1:8765/api/runs/${target}`);if(response.ok){const next=normalizeRunDetail(await response.json());if(active){setDetail(next);if(next.nodes.length&&!next.nodes.some(n=>n.id===selected))setSelected(next.nodes[0].id)}}}
+        if(target){const response=await fetch(`/api/runs/${target}`);if(response.ok){const next=normalizeRunDetail(await response.json());if(active){setDetail(next);if(next.nodes.length&&!next.nodes.some(n=>n.id===selected))setSelected(next.nodes[0].id)}}}
       }catch{if(active)setApiOnline(false)}
     }
     void refresh();const timer=window.setInterval(refresh,1500);return()=>{active=false;window.clearInterval(timer)};
   },[paused,detail?.id,selected]);
 
-  async function selectRun(id:string){try{const response=await fetch(`http://127.0.0.1:8765/api/runs/${id}`);if(!response.ok)return;const next=normalizeRunDetail(await response.json());setDetail(next);if(next.nodes[0])setSelected(next.nodes[0].id)}catch{setApiOnline(false)}}
+  async function selectRun(id:string){try{const response=await fetch(`/api/runs/${id}`);if(!response.ok)return;const next=normalizeRunDetail(await response.json());setDetail(next);if(next.nodes[0])setSelected(next.nodes[0].id)}catch{setApiOnline(false)}}
   async function startRun(){
     const query=newQuery.trim();if(!query)return;
     setStarting(true);setStartError('');
     try{
-      const response=await fetch('http://127.0.0.1:8765/api/runs',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({query})});
+      const response=await fetch('/api/runs',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({query})});
       const payload=await response.json() as {error?:unknown};
       if(!response.ok)throw new Error(str(payload.error,`启动失败 (${response.status})`));
       setShowCreate(false);setNewQuery('');setDetail(null);
@@ -291,8 +324,8 @@ export default function Home() {
   const reached=new Set((detail?.states||[]).map(s=>str(s.to)));
   const currentState=detail?.states.length?str(detail.states[detail.states.length-1].to):'';
   const flowView=flow.map(([code,label],index)=>{const stateName=['planning','dispatching','dispatching','collecting','synthesizing','adversarial'][index];const state=currentState===stateName?'active':reached.has(stateName)?'done':'idle';return[code,label,state]});
-  return <main className="app-shell">
-    <header className="topbar"><div className="brand-mark"><GitBranch/></div><div className="brand-copy"><strong>Deep Research</strong><span>Agent Observatory</span></div><div className="run-state"><span className={`live-pulse ${apiOnline?'':'offline'}`}/> {detail?.status?.toUpperCase()||(apiOnline?'IDLE':'OFFLINE')} {detail&&<><b>·</b> {Math.round(detail.elapsed_ms/1000)}s</>}</div><div className="top-actions"><button onClick={() => setPaused(!paused)}>{paused?<Play/>:<Pause/>}{paused?'继续刷新':'暂停刷新'}</button><button className="primary-button" onClick={()=>{setStartError('');setShowCreate(true)}}><Play/> 新建研究</button></div></header>
+  return <main className="app-shell" style={{gridTemplateColumns:`252px minmax(0,1fr) ${inspectorCollapsed?44:inspectorWidth}px`}}>
+    <header className="topbar"><div className="brand-mark"><GitBranch/></div><div className="brand-copy"><strong>Deep Research</strong><span>Agent Observatory</span></div><div className="run-state"><span className={`live-pulse ${apiOnline?'':'offline'}`}/> {detail?.status?.toUpperCase()||(apiOnline?'IDLE':'OFFLINE')} {detail&&<><b>·</b> {Math.round(detail.elapsed_ms/1000)}s</>}</div><div className="top-actions"><Link className="top-link" href="/research">用户版 →</Link><button onClick={() => setPaused(!paused)}>{paused?<Play/>:<Pause/>}{paused?'继续刷新':'暂停刷新'}</button><button className="primary-button" onClick={()=>{setStartError('');setShowCreate(true)}}><Play/> 新建研究</button></div></header>
     <aside className="run-sidebar"><div className="sidebar-title"><span>RESEARCH RUNS</span><button onClick={()=>setDetail(null)}><RotateCcw/></button></div><label className="search-box"><Search/><input aria-label="搜索运行" placeholder="搜索历史任务…"/></label><div className="run-list">{visibleRuns.length===0&&<div className="empty-runs">暂无研究记录</div>}{visibleRuns.map((r,i)=><button onClick={()=>selectRun(r.id)} className={`run-item ${(detail?.id===r.id||(!detail&&i===0))?'active':''}`} key={r.id}><StatusDot status={r.status}/><span><strong>{r.query}</strong><small>{new Date(r.started_at*1000).toLocaleString()} · {r.event_count} events</small></span></button>)}</div><div className="system-health"><span className="eyebrow">SYSTEM HEALTH</span><div><span>Dashboard API</span><b className={apiOnline?'healthy':'warning'}>{apiOnline?'healthy':'offline'}</b></div><div><span>Event stream</span><b className={apiOnline?'healthy':'warning'}>{apiOnline?'connected':'disconnected'}</b></div><div><span>Memory DB</span><b className="healthy">healthy</b></div></div></aside>
     <section className="workspace"><div className="query-header"><div><span className="eyebrow">ACTIVE QUERY</span><h1>{detail?.query||'尚未开始研究'}</h1></div>{detail&&<div className="query-meta"><span># {detail.id}</span><span>DeepSeek</span><span>并发 3</span></div>}</div>
       <div className="flow-strip">{flowView.map(([code,label,state],i) => <div className={`flow-step ${state}`} key={code}><span>{state==='done'?<Check/>:state==='active'?<Activity/>:i+1}</span><div><strong>{code}</strong><small>{label}</small></div>{i<flow.length-1&&<ArrowRight/>}</div>)}</div>
@@ -300,7 +333,18 @@ export default function Home() {
       <div className="content-tabs">{([['dag',GitBranch,'DAG 任务图'],['timeline',Activity,'执行时间线'],['payload',TerminalSquare,'原始事件']] as const).map(([id,Icon,label]) => <button className={tab===id?'active':''} onClick={() => setTab(id)} key={id}><Icon/>{label}</button>)}</div>
       <div className="main-canvas">{!detail&&<div className="empty-workspace"><GitBranch/><h2>暂无研究运行</h2><p>点击右上角“新建研究”，Planner 生成 DAG 后会在这里实时展示。</p><button onClick={()=>setShowCreate(true)}><Play/>新建研究</button></div>}{detail&&tab==='dag'&&<DagGraph graphNodes={graphNodes} selected={selected} onSelect={setSelected}/>} {detail&&tab==='timeline'&&<div className="timeline-view">{graphNodes.map((n,i)=><button key={n.id} onClick={()=>setSelected(n.id)}><span>{n.id}</span><strong>{n.label}</strong><i style={{width:`${25+i*8}%`}} className={`bar-${n.status}`}/><small>{n.duration||'等待'}</small></button>)}</div>} {detail&&tab==='payload'&&<pre className="payload-view">{JSON.stringify(detail.events,null,2)}</pre>}</div>
     </section>
-    <aside className="inspector">{node?<LoopPanel node={node} liveSteps={liveSteps} query={detail?.query||''} allNodes={graphNodes} outputs={detail?.outputs||{}} onSelect={setSelected} runId={detail?.id||''}/>:<div className="empty-inspector"><CircleDot/><span>选择一个 Agent 节点<br/>查看执行 Loop</span></div>}</aside>
+    <aside className={`inspector ${inspectorCollapsed?'collapsed':''}`}>
+      {!inspectorCollapsed&&(
+        // eslint-disable-next-line jsx-a11y/no-noninteractive-element-interactions, jsx-a11y/no-static-element-interactions
+        <div className="inspector-resize-handle" onMouseDown={startInspectorResize}/>
+      )}
+      {inspectorCollapsed
+        ? <button className="inspector-expand" onClick={()=>setInspectorCollapsed(false)} aria-label="展开检查器"><ChevronLeft/><span>INSPECTOR</span></button>
+        : <div className="inspector-body">
+            <div className="inspector-chrome"><span className="eyebrow">AGENT INSPECTOR</span><button className="inspector-collapse" onClick={()=>setInspectorCollapsed(true)} aria-label="收起检查器"><ChevronRight/></button></div>
+            {node?<LoopPanel node={node} liveSteps={liveSteps} query={detail?.query||''} allNodes={graphNodes} outputs={detail?.outputs||{}} onSelect={setSelected} runId={detail?.id||''}/>:<div className="empty-inspector"><CircleDot/><span>选择一个 Agent 节点<br/>查看执行 Loop</span></div>}
+          </div>}
+    </aside>
     {showCreate&&(
       // eslint-disable-next-line jsx-a11y/no-noninteractive-element-interactions
       <div className="modal-backdrop" role="presentation" onMouseDown={event=>{if(event.target===event.currentTarget&&!starting)setShowCreate(false)}}>

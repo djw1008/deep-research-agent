@@ -72,7 +72,7 @@ export default function CompressionPage() {
     void (async () => {
       if (!params.run || !params.node) { if (active) setState('missing'); return; }
       try {
-        const response = await fetch(`http://127.0.0.1:8765/api/runs/${encodeURIComponent(params.run)}`);
+        const response = await fetch(`/api/runs/${encodeURIComponent(params.run)}`);
         if (!response.ok) throw new Error(`Runs API ${response.status}`);
         const detail = await response.json() as Record<string, unknown>;
         if (!active) return;

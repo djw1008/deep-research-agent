@@ -14,6 +14,7 @@ import argparse
 import asyncio
 import logging
 import os
+import re
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -214,6 +215,7 @@ async def run_research(
     session_memory: SessionMemory | None = None,
     knowledge_base: KnowledgeBase | None = None,
     event_recorder: RunEventRecorder | None = None,
+    adversarial: bool = False,
 ) -> tuple:
     """执行单次研究并返回最终状态和报告。"""
     recorder = event_recorder or RunEventRecorder(query)
@@ -233,7 +235,7 @@ async def run_research(
         context = ResearchContext(
             topic=query,
             max_iterations=config.get("orchestrator", {}).get("max_replan_rounds", 3),
-            enable_adversarial=config.get("adversarial", {}).get("enabled", False),
+            enable_adversarial=adversarial or config.get("adversarial", {}).get("enabled", False),
         )
         final_state = await orch.run(
             context,
@@ -393,9 +395,24 @@ def save_report(query: str, report, config: dict) -> Path | None:
         f"- **整体置信度**: {getattr(report, 'confidence', 'N/A')}",
         f"- **引用来源数**: {len(getattr(report, 'sources', []))}",
         f"- **搜索次数**: {getattr(report, 'num_searches', 'N/A')}",
-        f"- **对抗轮数**: {getattr(report, 'adversarial_rounds', 'N/A')}",
-        f"- **最终评分**: {getattr(report, 'final_score', 'N/A')}",
-        f"- **五维评分**: {getattr(report, 'dimension_scores', {})}",
+    ]
+    # 对抗评分只有 Red/Blue 阶段实际运行后才会填充；
+    # 未启用时直接写"未启用"，避免输出 0.0 / {} 这类占位默认值
+    dimension_scores = getattr(report, "dimension_scores", None) or {}
+    adversarial_rounds = getattr(report, "adversarial_rounds", 0) or 0
+    if adversarial_rounds or dimension_scores:
+        dimension_scores_text = ", ".join(
+            f"{getattr(dim, 'value', dim)}: {score}"
+            for dim, score in dimension_scores.items()
+        )
+        content_lines += [
+            f"- **对抗轮数**: {adversarial_rounds}",
+            f"- **最终评分**: {getattr(report, 'final_score', 'N/A')}",
+            f"- **五维评分**: {dimension_scores_text}",
+        ]
+    else:
+        content_lines.append("- **对抗优化**: 未启用")
+    content_lines += [
         "",
         "---",
         "",
@@ -411,8 +428,98 @@ def save_report(query: str, report, config: dict) -> Path | None:
         url = src.get("url", "")
         content_lines.append(f"- [{title}]({url})")
 
-    filename.write_text("\n".join(content_lines), encoding="utf-8")
+    content = "\n".join(content_lines)
+    filename.write_text(content, encoding="utf-8")
+
+    # Dashboard 启动的 run：额外写一份到 debug_runs/<run_id>/report.md 供报告接口读取
+    run_id = os.environ.get("DEEP_RESEARCH_RUN_ID")
+    if run_id:
+        debug_report = work_dir / "debug_runs" / run_id / "report.md"
+        if debug_report.parent.is_dir():
+            debug_report.write_text(content, encoding="utf-8")
     return filename
+
+
+def parse_report_markdown(report_path: Path):
+    """从 save_report 生成的 report.md 重建 ResearchReport。"""
+    from deep_research.core.schema import ResearchReport
+
+    lines = report_path.read_text(encoding="utf-8").splitlines()
+    query = ""
+    confidence = 0.5
+    if lines and lines[0].startswith("# 研究报告: "):
+        query = lines[0][len("# 研究报告: "):].strip()
+    for line in lines:
+        if line.startswith("- **整体置信度**:"):
+            try:
+                confidence = float(line.split(":", 1)[1].strip())
+            except ValueError:
+                confidence = 0.5
+            break
+
+    # 正文：第一条 --- 之后、最后一条 ---（## 参考链接 之前）之间
+    separators = [i for i, line in enumerate(lines) if line.strip() == "---"]
+    content = ""
+    if len(separators) >= 2:
+        content = "\n".join(lines[separators[0] + 1:separators[-1]]).strip()
+
+    link_re = re.compile(r"^- \[(?P<title>[^\]]*)\]\((?P<url>[^)]*)\)\s*$")
+    sources = [
+        {"title": match.group("title"), "url": match.group("url")}
+        for match in (link_re.match(line.strip()) for line in lines)
+        if match
+    ]
+    return ResearchReport(query=query, content=content, confidence=confidence, sources=sources)
+
+
+async def upgrade_adversarial_run(
+    run_id: str,
+    config: dict,
+    session_memory: SessionMemory,
+    knowledge_base: KnowledgeBase,
+) -> int:
+    """对已完成的报告只跑 Red/Blue 对抗阶段（--upgrade-adversarial 模式）。"""
+    work_dir = Path(config.get("system", {}).get("work_dir", "./outputs"))
+    report_path = work_dir / "debug_runs" / run_id / "report.md"
+    if not report_path.exists():
+        logging.error("未找到报告文件: %s", report_path)
+        return 1
+
+    report = parse_report_markdown(report_path)
+    query = report.query or run_id
+    recorder = RunEventRecorder(query)
+    recorder.emit("state_transition", {"from": "done", "to": "adversarial"})
+
+    orch = None
+    try:
+        orch = build_orchestrator(
+            config,
+            session_memory=session_memory,
+            knowledge_base=knowledge_base,
+            event_sink=recorder,
+        )
+        upgraded = await orch.run_adversarial_upgrade(report, session_id=f"upgrade-{run_id}")
+        recorder.emit("run_completed", {
+            "state": "done",
+            "confidence": getattr(upgraded, "confidence", 0.0),
+            "sources": len(getattr(upgraded, "sources", [])),
+        })
+        saved = save_report(query, upgraded, config)
+        if saved:
+            logging.info("对抗升级报告已保存: %s", saved)
+        return 0
+    except Exception as exc:
+        logging.exception("对抗升级失败")
+        recorder.emit("run_failed", {
+            "state": "failed",
+            "error": f"{type(exc).__name__}: {exc}",
+        })
+        return 1
+    finally:
+        if orch is not None and orch.knowledge_base is not None:
+            await orch.knowledge_base.close()
+        if orch is not None and orch.session_memory is not None:
+            await orch.session_memory.close()
 
 
 async def main() -> int:
@@ -420,6 +527,8 @@ async def main() -> int:
     parser.add_argument("-q", "--query", help="研究问题（非交互模式下使用）")
     parser.add_argument("-c", "--config", default="config/default.yaml", help="配置文件路径")
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+    parser.add_argument("--adversarial", action="store_true", help="启用 Red/Blue 对抗优化")
+    parser.add_argument("--upgrade-adversarial", metavar="RUN_ID", help="对已完成 run 的报告只运行 Red/Blue 对抗优化阶段")
     args = parser.parse_args()
 
     setup_logging(args.log_level)
@@ -443,6 +552,11 @@ async def main() -> int:
     try:
         await session_memory.initialize()
         await knowledge_base.initialize()
+
+        if args.upgrade_adversarial:
+            return await upgrade_adversarial_run(
+                args.upgrade_adversarial, config, session_memory, knowledge_base,
+            )
 
         if args.query:
             session_id: str | None = None
@@ -484,6 +598,7 @@ async def main() -> int:
                 previous_session_context=previous_context,
                 session_memory=session_memory,
                 knowledge_base=knowledge_base,
+                adversarial=args.adversarial,
             )
 
             # Ensure session_id is stable for the next round

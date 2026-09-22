@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 import threading
 import time
 import uuid
+from enum import Enum
 from pathlib import Path
 from typing import Any, Callable
 
@@ -19,11 +21,18 @@ def _safe(value: Any, max_string: int = 12_000) -> Any:
     if isinstance(value, str):
         return value if len(value) <= max_string else value[:max_string] + "…[truncated]"
     if isinstance(value, dict):
-        return {str(key): _safe(item, max_string) for key, item in value.items()}
+        return {
+            (key.value if isinstance(key, Enum) else str(key)): _safe(item, max_string)
+            for key, item in value.items()
+        }
     if isinstance(value, (list, tuple)):
         return [_safe(item, max_string) for item in value]
     if value is None or isinstance(value, (bool, int, float)):
         return value
+    if isinstance(value, Enum):
+        return value.value
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        return _safe(dataclasses.asdict(value), max_string)
     return _safe(str(value), max_string)
 
 

@@ -241,7 +241,7 @@ async def test_run_no_issues():
     )
     assert result.status == AgentStatus.SUCCESS
     assert result.output is report
-    assert result.trajectory[0]["action"] == "no_issues_to_fix"
+    assert result.metadata["action"] == "no_issues_to_fix"
 
 
 @pytest.mark.asyncio
@@ -286,10 +286,12 @@ async def test_run_with_issues_records_self_verify():
     )
     assert result.status == AgentStatus.SUCCESS
     assert result.output.content == "修正后的报告。"
-    trajectory = result.trajectory[0]
-    assert trajectory["dimension"] == "hallucination"
-    assert len(trajectory["fixes"]) == 1
-    assert len(trajectory["self_verify_new_issues"]) == 1
+    metadata = result.metadata
+    assert metadata["dimension"] == "hallucination"
+    assert len(metadata["fixes"]) == 1
+    assert len(metadata["self_verify_new_issues"]) == 1
+    # trajectory 只保留可展示事件（role/content），内部数据走 metadata
+    assert all(step.get("role") for step in result.trajectory)
 
 
 @pytest.mark.asyncio

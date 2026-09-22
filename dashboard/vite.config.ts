@@ -46,9 +46,19 @@ export default defineConfig(async () => {
 
   return {
     css: { postcss: { plugins: [tailwindcss()] } },
-    server: isCodexSeatbeltSandbox
-      ? { watch: { useFsEvents: false, usePolling: true } }
-      : undefined,
+    server: {
+      // 浏览器可能处于系统代理之后（代理不放行 127.0.0.1:8765），
+      // 前端统一走同源 /api，由 dev server 转发到本地研究服务。
+      proxy: {
+        '/api': {
+          target: 'http://127.0.0.1:8765',
+          changeOrigin: true,
+        },
+      },
+      ...(isCodexSeatbeltSandbox
+        ? { watch: { useFsEvents: false, usePolling: true } }
+        : {}),
+    },
     plugins: [
       vinext(),
       sites(),

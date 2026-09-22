@@ -254,14 +254,39 @@ class BlueTeamAgent(BaseAgent):
                 task_id=task.id,
                 status=AgentStatus.SUCCESS,
                 output=report,
-                trajectory=[{"dimension": dimension.value, "action": "no_issues_to_fix"}],
+                trajectory=[
+                    {
+                        "role": "assistant",
+                        "content": f"{dimension.value} 维度没有需要修复的 issue，跳过修复。",
+                    }
+                ],
                 token_usage=0,
                 confidence=report.confidence,
+                metadata={"dimension": dimension.value, "action": "no_issues_to_fix"},
             )
 
         current_report = copy.deepcopy(report)
         fixes: list[dict[str, Any]] = []
         new_issues_log: list[dict[str, Any]] = []
+        trajectory: list[dict[str, Any]] = [
+            {
+                "role": "assistant",
+                "content": (
+                    f"收到 {dimension.value} 维度修复任务：基于当前报告"
+                    f"（{len(report.content)} 字符）修复 {len(filtered_issues)} 个 issue。"
+                ),
+            },
+            {
+                "role": "tool",
+                "name": "blue_input",
+                "result": {
+                    "dimension": dimension.value,
+                    "report_length": len(report.content),
+                    "issue_count": len(filtered_issues),
+                    "issues": filtered_issues,
+                },
+            },
+        ]
         token_usage = 0
 
         try:
@@ -285,6 +310,16 @@ class BlueTeamAgent(BaseAgent):
                     "changes": fix_result.get("changes", ""),
                 }
                 fixes.append(fix_record)
+                trajectory.append(
+                    {
+                        "role": "assistant",
+                        "content": (
+                            f"批次修复 [{fix_type.value}]：处理 {len(group)} 个 issue，"
+                            f"报告长度 {len(original_content)} → {len(current_report.content)}。"
+                            f"\n\n修改说明：{fix_result.get('changes', '')}"
+                        ),
+                    }
+                )
 
                 logger.info(
                     "BlueTeamAgent %s 批量修复完成：issue 数 %d，报告长度 %d -> %d，修改说明：%s",
@@ -302,6 +337,16 @@ class BlueTeamAgent(BaseAgent):
                     fixes=fixes,
                 )
                 token_usage += verify_result.get("token_usage", 0)
+                trajectory.append(
+                    {
+                        "role": "tool",
+                        "name": "self_verify",
+                        "result": {
+                            "has_new_issue": verify_result.get("has_new_issue", False),
+                            "new_issues": verify_result.get("new_issues", []),
+                        },
+                    }
+                )
 
                 if verify_result.get("has_new_issue"):
                     logger.warning(
@@ -325,19 +370,39 @@ class BlueTeamAgent(BaseAgent):
                 len(new_issues_log),
             )
 
+            trajectory.append(
+                {
+                    "role": "assistant",
+                    "content": (
+                        f"{dimension.value} 维度修复完成：{len(fixes)} 批修复"
+                        f"（共 {len(filtered_issues)} 个 issue），"
+                        f"自检发现 {len(new_issues_log)} 个新问题。"
+                    ),
+                }
+            )
+            trajectory.append(
+                {
+                    "role": "tool",
+                    "name": "blue_fixes",
+                    "result": {
+                        "fixes": fixes,
+                        "self_verify_new_issues": new_issues_log,
+                    },
+                }
+            )
+
             return AgentResult(
                 task_id=task.id,
                 status=AgentStatus.SUCCESS,
                 output=current_report,
-                trajectory=[
-                    {
-                        "dimension": dimension.value,
-                        "fixes": fixes,
-                        "self_verify_new_issues": new_issues_log,
-                    }
-                ],
+                trajectory=trajectory,
                 token_usage=token_usage,
                 confidence=current_report.confidence,
+                metadata={
+                    "dimension": dimension.value,
+                    "fixes": fixes,
+                    "self_verify_new_issues": new_issues_log,
+                },
             )
 
         except Exception as e:
@@ -346,9 +411,12 @@ class BlueTeamAgent(BaseAgent):
                 task_id=task.id,
                 status=AgentStatus.FAILED,
                 output=f"Blue repair failed: {type(e).__name__}: {e}",
-                trajectory=[{"dimension": dimension.value, "error": str(e)}],
+                trajectory=[
+                    {"role": "assistant", "content": f"修复失败：{type(e).__name__}: {e}"}
+                ],
                 token_usage=token_usage,
                 confidence=report.confidence,
+                metadata={"dimension": dimension.value, "error": str(e)},
             )
 
     def _filter_issues(self, issues: list[Issue]) -> list[Issue]:
