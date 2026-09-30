@@ -135,6 +135,64 @@ Overall Confidence: 0.80
 
 
 @pytest.mark.asyncio
+async def test_synthesizer_keeps_valid_citation_and_removes_dangling_one():
+    content = """# 报告
+
+## 结论
+有效引用 [1]，无效引用 [99]。
+
+Overall Confidence: 0.80
+"""
+    agent = SummarizerAgent(name="sum", policy=FakeLLMClient(content))
+    task = SubTask(id="synthesize", description="合成报告", task_type="synthesize")
+    source_result = AgentResult(
+        task_id="t1",
+        status=AgentStatus.SUCCESS,
+        output="材料",
+        confidence=1.0,
+        trajectory=[{
+            "role": "tool",
+            "result": [{
+                "title": "Source",
+                "url": "https://example.com/source",
+                "snippet": "evidence",
+            }],
+        }],
+    )
+
+    result = await agent.run(task, {"query": "test", "results": [source_result]})
+
+    assert "有效引用 [1]" in result.output.content
+    assert "[99]" not in result.output.content
+    assert result.output.sources[0]["citation_id"] == 1
+
+
+def test_synthesis_prompt_binds_material_to_registered_source_number():
+    agent = SummarizerAgent(name="sum", policy=FakeLLMClient(""))
+    source_result = AgentResult(
+        task_id="t1",
+        status=AgentStatus.SUCCESS,
+        output="该来源支持结论。",
+        confidence=0.9,
+        trajectory=[{
+            "role": "tool",
+            "result": [{
+                "title": "Primary Source",
+                "url": "https://example.com/primary",
+                "snippet": "supporting evidence",
+            }],
+        }],
+    )
+    sources = agent._collect_sources([source_result])
+
+    prompt = agent._build_synthesis_prompt("test", [source_result], sources)
+
+    assert "该材料关联的可用引用：[1]" in prompt
+    assert "[1] Primary Source" in prompt
+    assert "不得创造编号" in prompt
+
+
+@pytest.mark.asyncio
 async def test_synthesize_llm_error():
     class BadClient(LLMClient):
         def __init__(self):

@@ -22,6 +22,7 @@ from ..core.schema import (
     Severity,
     SubTask,
 )
+from ..core.report_content import prepare_sources
 from .base_agent import BaseAgent
 
 
@@ -169,6 +170,8 @@ PROMPT_SOURCE_CREDIBILITY = """请对以下研究报告的【来源可信度】�
 2. 评估内容类型（一手数据 / 分析报道 / 社论 / 用户生成内容）。
 3. 评估时效性：对于快速变化领域（科技、股市），1年以上为陈旧。
 4. 检查一手程度：优先一手数据，二手分析需标注原始来源。
+5. 核对正文中的数字引用 [N] 是否存在于下方去重来源列表，并判断该来源的标题、摘要与附近论断是否匹配。
+6. 关键事实或精确数字缺少正文引用时，应降低来源可信度评分并报告具体位置。
 
 请按以下 JSON 格式输出（不要有任何额外文字）：
 {
@@ -418,22 +421,17 @@ class RedTeamAgent(BaseAgent):
         """按 URL 去重后，将真实来源列表格式化给来源维度评分。"""
         if not sources:
             return "无来源"
-        unique_sources: list[dict] = []
-        seen_urls: set[str] = set()
-        for source in sources:
-            url = str(source.get("url", "")).strip()
-            if not url or url in seen_urls:
-                continue
-            seen_urls.add(url)
-            unique_sources.append(source)
+        unique_sources = prepare_sources(sources)
         if not unique_sources:
             return "无来源"
         lines = []
-        for i, s in enumerate(unique_sources, 1):
+        for s in unique_sources:
             title = s.get("title", "")
             url = s.get("url", "")
             snippet = s.get("snippet", "")
-            lines.append(f"[{i}] {title}\nURL: {url}\n摘要: {snippet}\n")
+            lines.append(
+                f"[{s['citation_id']}] {title}\nURL: {url}\n摘要: {snippet}\n"
+            )
         return "\n".join(lines)
 
     def _parse_dimension_json(self, content: str, dimension: AttackDimension) -> DimensionAttack:

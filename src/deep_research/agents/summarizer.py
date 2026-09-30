@@ -17,7 +17,11 @@ import re
 from typing import Any
 
 from ..core.schema import AgentResult, AgentStatus, ResearchReport, SubTask
-from ..core.report_content import strip_reference_sections
+from ..core.report_content import (
+    prepare_sources,
+    remove_invalid_citations,
+    strip_reference_sections,
+)
 from .base_agent import BaseAgent
 
 
@@ -72,8 +76,9 @@ class SummarizerAgent(BaseAgent):
                 confidence=0.0,
             )
 
-        # 构建 synthesis prompt
-        prompt = self._build_synthesis_prompt(query, results)
+        # 来源必须在合成前完成注册和编号，模型只能引用这些既有编号。
+        sources = self._collect_sources(results)
+        prompt = self._build_synthesis_prompt(query, results, sources)
         messages = [
             {"role": "system", "content": self._system_prompt()},
             {"role": "user", "content": prompt},
@@ -103,7 +108,7 @@ class SummarizerAgent(BaseAgent):
         token_usage = len(content) // 3  # 简化估算
 
         # 解析报告内容，提取来源和置信度
-        report = self._parse_report(query, content, results)
+        report = self._parse_report(query, content, results, sources)
 
         result = AgentResult(
             task_id=task.id,
@@ -123,7 +128,8 @@ class SummarizerAgent(BaseAgent):
             "不要描述你将要做什么——直接输出合成后的报告。\n\n"
             "<format>\n"
             "1. 使用 Markdown 格式。来源清单由程序根据检索记录统一生成；正文不得创建"
-            "『引用来源』『参考文献』『参考链接』『Sources』等章节，不得自行编造『来源 N』编号。\n"
+            "『引用来源』『参考文献』『参考链接』『Sources』等章节。正文需要来源支持时，"
+            "只能使用程序提供的数字引用，如 [1]；不得自行创建不存在的编号。\n"
             "2. 报告正文必须至少 3000 个中文字符（或 2000 个英文单词）。\n"
             "3. 结构：执行摘要 → 背景 → 关键发现（附细节）→ 分析 → 比较 → 影响 → 结论。\n"
             "4. 静默解决来源之间的矛盾：直接输出最终结论；数据有分歧时在行内标注"
@@ -140,7 +146,12 @@ class SummarizerAgent(BaseAgent):
             "</audience>"
         )
 
-    def _build_synthesis_prompt(self, query: str, results: list[AgentResult]) -> str:
+    def _build_synthesis_prompt(
+        self,
+        query: str,
+        results: list[AgentResult],
+        sources: list[dict[str, Any]] | None = None,
+    ) -> str:
         """构建合成 prompt，按置信度降序排列结果。
 
         内容完全相同的子结果只保留一份（Planner 可能拆出重复任务），
@@ -165,6 +176,8 @@ class SummarizerAgent(BaseAgent):
         for target in duplicate_of.values():
             dup_counts[target] = dup_counts.get(target, 0) + 1
 
+        sources = sources if sources is not None else self._collect_sources(results)
+        source_id_by_url = {source["url"]: source["citation_id"] for source in sources}
         parts = [
             f"# Research Question\n{query}\n",
             f"# 研究材料（共 {len(unique_results)} 份）\n",
@@ -172,11 +185,32 @@ class SummarizerAgent(BaseAgent):
         for i, r in enumerate(unique_results, 1):
             status_icon = "✓" if r.status == AgentStatus.SUCCESS else "✗"
             dup_note = f"（另有 {dup_counts[i]} 份材料内容与此完全相同，视为同一来源的重复确认）\n" if dup_counts.get(i) else ""
+            material_ids = sorted({
+                source_id_by_url[url]
+                for url in self._source_urls(r)
+                if url in source_id_by_url
+            })
+            citation_note = (
+                "该材料关联的可用引用：" + ", ".join(f"[{sid}]" for sid in material_ids) + "\n"
+                if material_ids else "该材料没有已注册来源，不得为其中结论虚构引用。\n"
+            )
             parts.append(
                 f"## 材料 {i} [{status_icon}] (confidence: {r.confidence:.2f})\n"
                 f"{dup_note}"
+                f"{citation_note}"
                 f"内容：\n{_output_text(r)}\n"
             )
+
+        parts.append("\n# 可用引用注册表\n")
+        if sources:
+            for source in sources:
+                parts.append(
+                    f"[{source['citation_id']}] {source.get('title', '')}\n"
+                    f"URL: {source['url']}\n"
+                    f"摘要: {source.get('snippet', '')}\n"
+                )
+        else:
+            parts.append("无已注册来源。正文不得生成数字引用。\n")
 
         parts.append(
             "\n# Instructions\n"
@@ -186,9 +220,62 @@ class SummarizerAgent(BaseAgent):
             "4. 结构：执行摘要 → 背景 → 关键发现（附细节）→ 分析 → 比较 → 影响 → 结论。\n"
             "5. 静默解决材料之间的矛盾：直接输出最终结论，数据有分歧时在行内标注（如「存疑」「来源存在分歧」），不要描述解决过程，不要为矛盾单设章节。\n"
             "6. 严禁在报告中引用内部标签（「材料 N」「Result N」「子任务」「验证任务」等），也不要提及材料的数量、重复情况或你的整合方式。\n"
-            "7. 明确列出所有引用的来源（写真实 URL 和标题）。"
+            "7. 需要来源支持的事实，使用与该材料关联的已有编号 [N]；不得创造编号，"
+            "不得在正文中直接写 URL，也不得生成参考文献章节。"
         )
         return "\n".join(parts)
+
+    def _source_urls(self, result: AgentResult) -> list[str]:
+        """Extract source URLs associated with one research result."""
+        urls: list[str] = []
+        for step in result.trajectory:
+            if step.get("role") != "tool":
+                continue
+            res = step.get("result")
+            items: list[dict] = []
+            if isinstance(res, list):
+                items = [item for item in res if isinstance(item, dict)]
+            elif isinstance(res, dict):
+                if isinstance(res.get("results"), list):
+                    items = [item for item in res["results"] if isinstance(item, dict)]
+                elif isinstance(res.get("papers"), list):
+                    items = [item for item in res["papers"] if isinstance(item, dict)]
+            for item in items:
+                url = str(item.get("url") or item.get("pdf_url") or "").strip()
+                if url:
+                    urls.append(url)
+        return urls
+
+    def _collect_sources(self, results: list[AgentResult]) -> list[dict[str, Any]]:
+        """Collect, filter, deduplicate and number sources before synthesis."""
+        collected: list[dict[str, Any]] = []
+        for result in results:
+            if result.status != AgentStatus.SUCCESS:
+                continue
+            for step in result.trajectory:
+                if step.get("role") != "tool":
+                    continue
+                res = step.get("result")
+                items: list[dict] = []
+                if isinstance(res, list):
+                    items = [item for item in res if isinstance(item, dict)]
+                elif isinstance(res, dict) and isinstance(res.get("results"), list):
+                    items = [item for item in res["results"] if isinstance(item, dict)]
+                elif isinstance(res, dict) and isinstance(res.get("papers"), list):
+                    items = [item for item in res["papers"] if isinstance(item, dict)]
+                for item in items:
+                    url = str(item.get("url") or item.get("pdf_url") or "").strip()
+                    if not url or self._is_noise_url(url):
+                        continue
+                    collected.append({
+                        "url": url,
+                        "title": item.get("title", ""),
+                        "snippet": str(
+                            item.get("snippet") or item.get("summary") or ""
+                        )[:500],
+                        "task_id": result.task_id,
+                    })
+        return prepare_sources(collected)
 
     _NOISE_DOMAINS = {
         # 社交媒体
@@ -217,7 +304,13 @@ class SummarizerAgent(BaseAgent):
         url_lower = url.lower()
         return any(b in url_lower for b in cls._NOISE_DOMAINS)
 
-    def _parse_report(self, query: str, content: str, results: list[AgentResult]) -> ResearchReport:
+    def _parse_report(
+        self,
+        query: str,
+        content: str,
+        results: list[AgentResult],
+        sources: list[dict[str, Any]] | None = None,
+    ) -> ResearchReport:
         """从 LLM 输出中解析 ResearchReport，并基于子任务成功率校准置信度。"""
         # 1. 从文本中提取 LLM 自评置信度（支持中英文格式）
         # 如果 LLM 遗漏，fallback 到子任务平均置信度，而非硬编码 0.5
@@ -257,61 +350,8 @@ class SummarizerAgent(BaseAgent):
             flags=re.IGNORECASE,
         ).rstrip()
         content = strip_reference_sections(content)
-
-        # 收集来源（从各个子结果的轨迹中提取）
-        sources: list[dict] = []
-        for r in results:
-            if r.status != AgentStatus.SUCCESS:
-                continue
-            for step in r.trajectory:
-                if step.get("role") != "tool":
-                    continue
-                res = step.get("result")
-                if isinstance(res, list):
-                    # web_search 返回 list[dict]
-                    for item in res:
-                        if isinstance(item, dict) and "url" in item:
-                            sources.append({
-                                "url": item["url"],
-                                "title": item.get("title", ""),
-                                "snippet": item.get("snippet", ""),
-                                "task_id": r.task_id,
-                            })
-                elif isinstance(res, dict):
-                    if "results" in res and isinstance(res["results"], list):
-                        for item in res["results"]:
-                            if isinstance(item, dict) and "url" in item:
-                                sources.append({
-                                    "url": item["url"],
-                                    "title": item.get("title", ""),
-                                    "snippet": item.get("snippet", ""),
-                                    "task_id": r.task_id,
-                                })
-                    elif "papers" in res and isinstance(res["papers"], list):
-                        for paper in res["papers"]:
-                            if isinstance(paper, dict) and "pdf_url" in paper:
-                                sources.append({
-                                    "url": paper["pdf_url"],
-                                    "title": paper.get("title", ""),
-                                    "snippet": paper.get("summary", "")[:200],
-                                    "task_id": r.task_id,
-                                })
-
-        # 去重 + 域名过滤
-        seen = set()
-        unique_sources = []
-        for s in sources:
-            url = s.get("url", "")
-            if not url or not url.strip():
-                continue
-            key = url
-            if key in seen:
-                continue
-            # 过滤垃圾域名
-            if self._is_noise_url(url):
-                continue
-            seen.add(key)
-            unique_sources.append(s)
+        sources = prepare_sources(sources if sources is not None else self._collect_sources(results))
+        content = remove_invalid_citations(content, sources)
 
         # 统计实际工具调用次数
         num_searches = sum(
@@ -322,7 +362,7 @@ class SummarizerAgent(BaseAgent):
         return ResearchReport(
             query=query,
             content=content,
-            sources=unique_sources,
+            sources=sources,
             confidence=confidence,
             num_searches=num_searches,
         )

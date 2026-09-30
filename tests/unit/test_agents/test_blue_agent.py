@@ -388,6 +388,7 @@ async def test_run_search_issue_uses_function_calling():
             "title": "Result for AI safety regulation 2024",
             "snippet": "supporting snippet",
             "task_id": "blue_agent",
+            "citation_id": 1,
         }
     ]
     assert policy.call_count == 2

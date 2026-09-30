@@ -29,7 +29,11 @@ from ..core.schema import (
     Severity,
     SubTask,
 )
-from ..core.report_content import strip_reference_sections
+from ..core.report_content import (
+    prepare_sources,
+    remove_invalid_citations,
+    strip_reference_sections,
+)
 from .base_agent import BaseAgent
 
 
@@ -51,8 +55,8 @@ SYSTEM_BLUE_AGENT = (
     "2. 如果信息无法验证，应删除该论断或添加 [未经证实]/[来源待补充] 标注。\n"
     "3. 每次只修改 issue 明确指向的位置，不要扩大范围。\n"
     "4. 输出必须是严格的 JSON 格式，包含完整的修改后报告。\n"
-    "5. 来源清单由程序维护。不得创建或修改引用来源/参考文献/参考链接章节，"
-    "不得自行生成『来源 N』或数字引用编号。"
+    "5. 来源清单由程序维护。不得创建或修改引用来源/参考文献/参考链接章节。"
+    "正文只能使用可用 Sources 或搜索工具返回的既有数字编号 [N]，不得自行创建编号。"
 )
 
 
@@ -280,10 +284,13 @@ class BlueTeamAgent(BaseAgent):
                 )
                 token_usage += fix_result.get("token_usage", 0)
 
-                current_report.content = strip_reference_sections(fix_result["content"])
                 current_report.sources = self._merge_sources(
                     current_report.sources,
                     fix_result.get("sources", []),
+                )
+                current_report.content = remove_invalid_citations(
+                    strip_reference_sections(fix_result["content"]),
+                    current_report.sources,
                 )
                 fix_record = {
                     "dimension": dimension.value,
@@ -440,7 +447,7 @@ class BlueTeamAgent(BaseAgent):
                 report, issues, query, dimension, web_search_tool
             )
             content, token_usage, new_sources = await self._run_repair_loop(
-                messages, fix_type, web_search_tool, query
+                messages, fix_type, web_search_tool, query, report.sources
             )
 
             parsed = self._parse_fix_json(content)
@@ -550,6 +557,7 @@ class BlueTeamAgent(BaseAgent):
         fix_type: FixType,
         web_search_tool: Any | None,
         query: str,
+        existing_sources: list[dict[str, Any]],
         max_tool_turns: int = 2,
     ) -> tuple[str, int, list[dict[str, Any]]]:
         """运行修复 LLM 调用循环，处理可选的 function calling。"""
@@ -580,7 +588,13 @@ class BlueTeamAgent(BaseAgent):
             )
 
             collected_sources.extend(
-                await self._execute_tool_calls(tool_calls, web_search_tool, messages, query)
+                await self._execute_tool_calls(
+                    tool_calls,
+                    web_search_tool,
+                    messages,
+                    query,
+                    existing_sources + collected_sources,
+                )
             )
 
             # 提示模型基于搜索结果继续
@@ -597,6 +611,7 @@ class BlueTeamAgent(BaseAgent):
         web_search_tool: Any | None,
         messages: list[dict[str, Any]],
         query: str,
+        existing_sources: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
         """执行一批 tool_calls，把结果以 tool 消息形式追加到 messages。"""
         collected_sources: list[dict[str, Any]] = []
@@ -634,9 +649,26 @@ class BlueTeamAgent(BaseAgent):
                 result = await web_search_tool.execute(search_query, num_results=num_results)
 
             if isinstance(result, list):
-                collected_sources.extend(
+                candidates = [
                     item for item in result
                     if isinstance(item, dict) and item.get("url")
+                ]
+                registry = prepare_sources(existing_sources + collected_sources + candidates)
+                citation_by_url = {
+                    source["url"]: source["citation_id"] for source in registry
+                }
+                annotated_result = []
+                for item in result:
+                    annotated = dict(item) if isinstance(item, dict) else item
+                    if isinstance(annotated, dict) and annotated.get("url") in citation_by_url:
+                        annotated["citation_id"] = citation_by_url[annotated["url"]]
+                    annotated_result.append(annotated)
+                result = annotated_result
+                collected_sources.extend(
+                    source for source in registry
+                    if source["url"] not in {
+                        str(existing.get("url", "")).strip() for existing in existing_sources
+                    }
                 )
 
             # 对搜索结果做 L2 压缩，避免上下文爆炸
@@ -667,11 +699,13 @@ class BlueTeamAgent(BaseAgent):
         if not sources:
             return "无来源"
         lines = []
-        for i, s in enumerate(sources, 1):
+        for s in prepare_sources(sources):
             title = s.get("title", "")
             url = s.get("url", "")
             snippet = s.get("snippet", "")
-            lines.append(f"[{i}] {title}\nURL: {url}\n摘要: {snippet}\n")
+            lines.append(
+                f"[{s['citation_id']}] {title}\nURL: {url}\n摘要: {snippet}\n"
+            )
         return "\n".join(lines)
 
     def _merge_sources(
@@ -680,20 +714,16 @@ class BlueTeamAgent(BaseAgent):
         discovered: list[dict],
     ) -> list[dict]:
         """Merge tool-discovered sources into report metadata, deduplicated by URL."""
-        merged = list(existing or [])
-        seen = {str(source.get("url", "")).strip() for source in merged}
-        for source in discovered or []:
-            url = str(source.get("url", "")).strip()
-            if not url or url in seen:
-                continue
-            merged.append({
-                "url": url,
+        normalized_discovered = [
+            {
+                "url": str(source.get("url", "")).strip(),
                 "title": str(source.get("title", "")),
                 "snippet": str(source.get("snippet", "")),
                 "task_id": "blue_agent",
-            })
-            seen.add(url)
-        return merged
+            }
+            for source in discovered or []
+        ]
+        return prepare_sources(list(existing or []) + normalized_discovered)
 
     def _format_prompt(self, template: str, **kwargs) -> str:
         """安全格式化 prompt：转义 JSON 中的花括号，只保留已知占位符。"""
@@ -724,7 +754,8 @@ class BlueTeamAgent(BaseAgent):
 
         try:
             full_text = "\n\n---\n\n".join(
-                f"[{i + 1}] {r.get('title', '')}\nURL: {r.get('url', '')}\n{r.get('snippet', '')}"
+                f"[{r.get('citation_id', i + 1)}] {r.get('title', '')}\n"
+                f"URL: {r.get('url', '')}\n{r.get('snippet', '')}"
                 for i, r in enumerate(valid_results)
             )
 

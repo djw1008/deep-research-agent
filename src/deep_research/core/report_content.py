@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from typing import Any
 
 
 _REFERENCE_HEADING = re.compile(
@@ -22,3 +23,40 @@ def strip_reference_sections(content: str) -> str:
     if match is None:
         return content
     return content[: match.start()].rstrip()
+
+
+_CITATION = re.compile(r"\[(\d+)\]")
+
+
+def prepare_sources(sources: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Deduplicate sources by URL and assign stable sequential citation numbers."""
+    prepared: list[dict[str, Any]] = []
+    seen_urls: set[str] = set()
+    for source in sources or []:
+        url = str(source.get("url", "")).strip()
+        if not url or url in seen_urls:
+            continue
+        seen_urls.add(url)
+        item = dict(source)
+        item["url"] = url
+        item["citation_id"] = len(prepared) + 1
+        prepared.append(item)
+    return prepared
+
+
+def invalid_citation_ids(content: str, sources: list[dict[str, Any]]) -> set[int]:
+    """Return numeric citations in content that do not exist in the registry."""
+    valid_ids = {int(source["citation_id"]) for source in sources if source.get("citation_id")}
+    used_ids = {int(match) for match in _CITATION.findall(content or "")}
+    return used_ids - valid_ids
+
+
+def remove_invalid_citations(content: str, sources: list[dict[str, Any]]) -> str:
+    """Remove dangling numeric citations while preserving valid registered ones."""
+    invalid = invalid_citation_ids(content, sources)
+    if not invalid:
+        return content
+    return _CITATION.sub(
+        lambda match: "" if int(match.group(1)) in invalid else match.group(0),
+        content,
+    )

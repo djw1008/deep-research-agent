@@ -33,7 +33,11 @@ import yaml
 
 from deep_research.agents import AgentPool
 from deep_research.core import Orchestrator, ResearchContext
-from deep_research.core.report_content import strip_reference_sections
+from deep_research.core.report_content import (
+    prepare_sources,
+    remove_invalid_citations,
+    strip_reference_sections,
+)
 from deep_research.memory import (
     KnowledgeBase,
     SessionMemory,
@@ -399,12 +403,20 @@ def save_report(query: str, report, config: dict) -> Path | None:
     safe_query = "".join(c if c.isalnum() or c in "_-" else "_" for c in query[:30])
     filename = work_dir / f"report_{safe_query}_{timestamp}.md"
 
+    sources = prepare_sources(getattr(report, "sources", []))
+    report.sources = sources
+    report_content = remove_invalid_citations(
+        strip_reference_sections(getattr(report, "content", "(无内容)")),
+        sources,
+    )
+    report.content = report_content
+
     content_lines = [
         f"# 研究报告: {query}",
         "",
         f"- **生成时间**: {datetime.now().isoformat()}",
         f"- **整体置信度**: {getattr(report, 'confidence', 'N/A')}",
-        f"- **引用来源数**: {len(getattr(report, 'sources', []))}",
+        f"- **引用来源数**: {len(sources)}",
         f"- **搜索次数**: {getattr(report, 'num_searches', 'N/A')}",
     ]
     # 对抗评分只有 Red/Blue 阶段实际运行后才会填充；
@@ -427,17 +439,17 @@ def save_report(query: str, report, config: dict) -> Path | None:
         "",
         "---",
         "",
-        strip_reference_sections(getattr(report, "content", "(无内容)")),
+        report_content,
         "",
         "---",
         "",
         "## 参考链接",
         "",
     ]
-    for src in getattr(report, "sources", []):
+    for src in sources:
         title = src.get("title", "")
         url = src.get("url", "")
-        content_lines.append(f"- [{title}]({url})")
+        content_lines.append(f"- [{src['citation_id']}] [{title}]({url})")
 
     content = "\n".join(content_lines)
     filename.write_text(content, encoding="utf-8")
@@ -475,13 +487,28 @@ def parse_report_markdown(report_path: Path):
         content = "\n".join(lines[separators[0] + 1:separators[-1]]).strip()
         content = strip_reference_sections(content)
 
-    link_re = re.compile(r"^- \[(?P<title>[^\]]*)\]\((?P<url>[^)]*)\)\s*$")
+    link_re = re.compile(
+        r"^- (?:\[(?P<citation_id>\d+)\]\s+)?"
+        r"\[(?P<title>[^\]]*)\]\((?P<url>[^)]*)\)\s*$"
+    )
     sources = [
-        {"title": match.group("title"), "url": match.group("url")}
+        {
+            "title": match.group("title"),
+            "url": match.group("url"),
+            **(
+                {"citation_id": int(match.group("citation_id"))}
+                if match.group("citation_id") else {}
+            ),
+        }
         for match in (link_re.match(line.strip()) for line in lines)
         if match
     ]
-    return ResearchReport(query=query, content=content, confidence=confidence, sources=sources)
+    return ResearchReport(
+        query=query,
+        content=content,
+        confidence=confidence,
+        sources=prepare_sources(sources),
+    )
 
 
 async def upgrade_adversarial_run(
