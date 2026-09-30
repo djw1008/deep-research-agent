@@ -150,6 +150,22 @@ def test_format_sources(agent):
     assert "https://test.com" in text
 
 
+def test_format_sources_deduplicates_and_ignores_empty_urls(agent):
+    sources = [
+        {"title": "First", "url": "https://example.com/a", "snippet": "one"},
+        {"title": "Duplicate", "url": "https://example.com/a", "snippet": "two"},
+        {"title": "No URL", "url": "", "snippet": "three"},
+        {"title": "Second", "url": "https://example.com/b", "snippet": "four"},
+    ]
+
+    text = agent._format_sources(sources)
+
+    assert text.count("https://example.com/a") == 1
+    assert text.count("https://example.com/b") == 1
+    assert "Duplicate" not in text
+    assert "No URL" not in text
+
+
 def test_parse_dimension_json(agent):
     json_text = json.dumps(
         {

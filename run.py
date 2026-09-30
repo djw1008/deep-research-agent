@@ -33,6 +33,7 @@ import yaml
 
 from deep_research.agents import AgentPool
 from deep_research.core import Orchestrator, ResearchContext
+from deep_research.core.report_content import strip_reference_sections
 from deep_research.memory import (
     KnowledgeBase,
     SessionMemory,
@@ -52,6 +53,16 @@ from deep_research.tools import (
     ToolRegistry,
     WebSearchTool,
 )
+
+
+# 报告标题形如 "# 研究报告: {query}"；若把标题文本再次当作 query 提交，
+# 前缀会逐轮累积（"研究报告: 研究报告: ..."），入口统一剥掉
+_QUERY_PREFIX_RE = re.compile(r"^(?:\s*研究报告\s*[:：]\s*)+")
+
+
+def sanitize_query(query: str) -> str:
+    """剥离 query 开头累积的 '研究报告: ' 前缀。"""
+    return _QUERY_PREFIX_RE.sub("", query).strip()
 
 
 def setup_logging(level: str = "INFO") -> None:
@@ -416,7 +427,7 @@ def save_report(query: str, report, config: dict) -> Path | None:
         "",
         "---",
         "",
-        getattr(report, "content", "(无内容)"),
+        strip_reference_sections(getattr(report, "content", "(无内容)")),
         "",
         "---",
         "",
@@ -462,6 +473,7 @@ def parse_report_markdown(report_path: Path):
     content = ""
     if len(separators) >= 2:
         content = "\n".join(lines[separators[0] + 1:separators[-1]]).strip()
+        content = strip_reference_sections(content)
 
     link_re = re.compile(r"^- \[(?P<title>[^\]]*)\]\((?P<url>[^)]*)\)\s*$")
     sources = [
@@ -486,7 +498,7 @@ async def upgrade_adversarial_run(
         return 1
 
     report = parse_report_markdown(report_path)
-    query = report.query or run_id
+    query = sanitize_query(report.query or run_id)
     recorder = RunEventRecorder(query)
     recorder.emit("state_transition", {"from": "done", "to": "adversarial"})
 
@@ -560,9 +572,10 @@ async def main() -> int:
 
         if args.query:
             session_id: str | None = None
-            query = args.query
+            query = sanitize_query(args.query)
         else:
             session_id, query = await prompt_session_selection(session_memory)
+            query = sanitize_query(query)
 
         orch_cfg = config.get("orchestrator", {})
         global_timeout = orch_cfg.get("global_timeout_seconds", 300)
@@ -630,7 +643,7 @@ async def main() -> int:
             if choice == "2":
                 current_session_id = None
                 current_round = 1
-                current_query = input("请输入新的研究问题: ").strip()
+                current_query = sanitize_query(input("请输入新的研究问题: ").strip())
                 if not current_query:
                     print("问题不能为空，退出。")
                     return 1
@@ -639,7 +652,7 @@ async def main() -> int:
             # choice == "1": continue current research
             current_round += 1
             follow_up = input("请输入继续研究的方向: ").strip()
-            current_query = follow_up or current_query
+            current_query = sanitize_query(follow_up or current_query)
 
     except SystemExit:
         return 1

@@ -333,6 +333,36 @@ class FakeRedAgent:
         )
 
 
+class SequencedFakeRedAgent(FakeRedAgent):
+    """按轮次返回不同评分/问题，用于验证修复后的最终复评。"""
+
+    def __init__(self, round_scores, first_round_issues):
+        super().__init__()
+        self.round_scores = round_scores
+        self.first_round_issues = first_round_issues
+        self.calls = 0
+
+    async def run(self, task, context):
+        round_no = context.get("round_no", 1)
+        dimension = context.get("dimension")
+        self.calls += 1
+        score = self.round_scores[min(round_no - 1, len(self.round_scores) - 1)]
+        issues = self.first_round_issues if round_no == 1 else []
+        dim_attack = DimensionAttack(
+            dimension=dimension,
+            dimension_score=score,
+            issues=list(issues),
+        )
+        return AgentResult(
+            task_id=task.id,
+            status=AgentStatus.SUCCESS,
+            output=dim_attack,
+            trajectory=[{"round": round_no, "dimension": dimension.value}],
+            token_usage=0,
+            confidence=score / 10.0,
+        )
+
+
 class FakeBlueAgent:
     async def run(self, task, context):
         report = context.get("report")
@@ -416,7 +446,11 @@ async def test_builtin_adversarial_loop_reaches_done():
 async def test_builtin_adversarial_loop_stops_at_threshold():
     """测试当 Red 评分达到阈值时，对抗循环提前结束。"""
     dimension_scores = {dim: 10.0 for dim in AttackDimension}
-    pool = FakeAgentPool(red_agent=FakeRedAgent(dimension_scores=dimension_scores))
+    blue_agent = RecordingFakeBlueAgent()
+    pool = FakeAgentPool(
+        red_agent=FakeRedAgent(dimension_scores=dimension_scores),
+        blue_agent=blue_agent,
+    )
 
     config = {
         "adversarial": {
@@ -441,6 +475,49 @@ async def test_builtin_adversarial_loop_stops_at_threshold():
     assert final_state == WorkflowState.DONE
     assert orch._report.adversarial_rounds == 1
     assert orch._report.final_score == 10.0
+    assert len(blue_agent.calls) == 0
+
+
+@pytest.mark.asyncio
+async def test_builtin_adversarial_rescores_after_last_blue_fix():
+    """最后一次 Blue 修复后必须再由 Red 评分，final_score 才对应最终报告。"""
+    from deep_research.core.schema import Issue, Severity, FixType
+
+    issue = Issue(
+        dimension=AttackDimension.FACTUAL,
+        severity=Severity.MAJOR,
+        location="第1段",
+        description="需要修复的问题",
+        fix_type=FixType.IN_PLACE,
+    )
+    red_agent = SequencedFakeRedAgent([8.0, 10.0], [issue])
+    blue_agent = RecordingFakeBlueAgent()
+    pool = FakeAgentPool(red_agent=red_agent, blue_agent=blue_agent)
+    config = {
+        "adversarial": {
+            "enabled": True,
+            "max_rounds": 1,
+            "score_threshold": 9.0,
+            "entry_confidence_threshold": 0.8,
+            "delta_threshold": 0.1,
+            "min_severity_to_fix": "major",
+            "save_logs": False,
+        },
+        "system": {"work_dir": "./outputs"},
+    }
+
+    orch = Orchestrator(agent_pool=pool, config=config)
+    orch._report = ResearchReport(query="AI safety", content="Test report", confidence=0.5)
+    orch._state = WorkflowState.ADVERSARIAL
+
+    final_state = await orch._do_adversarial()
+
+    assert final_state == WorkflowState.DONE
+    assert len(blue_agent.calls) == 1
+    assert red_agent.calls == len(AttackDimension) * 2
+    assert orch._report.adversarial_rounds == 2
+    assert orch._report.final_score == 10.0
+    assert orch._report.adversarial_history[-1]["blue_fixes"] == []
 
 
 @pytest.mark.asyncio
@@ -588,3 +665,91 @@ async def test_builtin_adversarial_terminates_on_oscillation():
     # Round 1: 进入修复；Round 2: 发现相同 issue，震荡终止
     assert orch._report.adversarial_rounds == 2
     assert orch._report.adversarial_history[-1].get("terminated_by_oscillation") is True
+
+
+@pytest.mark.asyncio
+async def test_builtin_adversarial_restores_best_scoring_report():
+    """分数先升后降时，应回退到历史最佳版本交付，final_score 与制品一致。"""
+    from deep_research.core.schema import Issue, Severity, FixType
+
+    issue = Issue(
+        dimension=AttackDimension.FACTUAL,
+        severity=Severity.MAJOR,
+        location="第1段",
+        description="需要修复的问题",
+        fix_type=FixType.IN_PLACE,
+    )
+
+    class IssuesUntilRound2RedAgent(FakeRedAgent):
+        def __init__(self):
+            super().__init__()
+            self.round_scores = [6.0, 8.0, 7.0]
+
+        async def run(self, task, context):
+            round_no = context.get("round_no", 1)
+            dimension = context.get("dimension")
+            score = self.round_scores[min(round_no - 1, len(self.round_scores) - 1)]
+            issues = [issue] if round_no <= 2 else []
+            dim_attack = DimensionAttack(
+                dimension=dimension,
+                dimension_score=score,
+                issues=list(issues),
+            )
+            return AgentResult(
+                task_id=task.id,
+                status=AgentStatus.SUCCESS,
+                output=dim_attack,
+                trajectory=[],
+                token_usage=0,
+                confidence=score / 10.0,
+            )
+
+    class MutatingFakeBlueAgent:
+        def __init__(self):
+            self.calls = 0
+
+        async def run(self, task, context):
+            import copy as _copy
+
+            report = _copy.deepcopy(context.get("report"))
+            self.calls += 1
+            report.content += f" fix{self.calls}"
+            return AgentResult(
+                task_id=task.id,
+                status=AgentStatus.SUCCESS,
+                output=report,
+                trajectory=[],
+                token_usage=0,
+                confidence=report.confidence,
+            )
+
+    pool = FakeAgentPool(
+        red_agent=IssuesUntilRound2RedAgent(),
+        blue_agent=MutatingFakeBlueAgent(),
+    )
+    config = {
+        "adversarial": {
+            "enabled": True,
+            "max_rounds": 5,
+            "score_threshold": 9.5,
+            "entry_confidence_threshold": 0.5,
+            "delta_threshold": 0.1,
+            "min_severity_to_fix": "major",
+            "enable_oscillation_check": False,
+            "save_logs": False,
+        },
+        "system": {"work_dir": "./outputs"},
+    }
+
+    orch = Orchestrator(agent_pool=pool, config=config)
+    orch._report = ResearchReport(query="AI safety", content="Test report", confidence=0.3)
+    orch._state = WorkflowState.ADVERSARIAL
+
+    final_state = await orch._do_adversarial()
+
+    assert final_state == WorkflowState.DONE
+    # Round 3 评分 7.0 < 上轮 8.0，提升为负触发收敛；最佳版本是第 2 轮的 8.0
+    assert orch._report.adversarial_history[-1].get("restored_best") is True
+    assert orch._report.final_score == 8.0
+    # 交付的是第 2 轮评分对应的报告（只含第 1 轮修复），不是最终轮改坏的版本
+    assert orch._report.content == "Test report fix1"

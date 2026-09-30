@@ -237,7 +237,7 @@ function buildLoopSteps(events: Record<string, unknown>[]): LoopStep[] {
     }
     const calls=Array.isArray(event.tool_calls)?event.tool_calls as Record<string,unknown>[]:[];
     const output:LoopStep[]=[];
-    if(event.content||calls.length===0)output.push({turn,kind:'thought',title:calls.length?'模型决策':'模型响应',detail:str(event.content,'（空响应）'),meta:'assistant'});
+    if(event.content||calls.length===0)output.push({turn,kind:'thought',title:event.log===true?'执行日志':calls.length?'模型决策':'模型响应',detail:str(event.content,'（空响应）'),meta:'assistant'});
     for(const call of calls){
       const fn=call.function&&typeof call.function==='object'?call.function as Record<string,unknown>:{};
       const toolName=str(fn.name,'unknown_tool');

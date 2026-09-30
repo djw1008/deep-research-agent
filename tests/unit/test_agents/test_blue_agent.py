@@ -178,50 +178,6 @@ async def test_apply_fix_in_place(agent):
 
 
 # ---------------------------------------------------------------------------
-# Self-verify
-# ---------------------------------------------------------------------------
-
-@pytest.mark.asyncio
-async def test_self_verify_detects_new_issue(agent):
-    agent.policy.responses = [
-        json.dumps(
-            {
-                "has_new_issue": True,
-                "new_issues": [
-                    {
-                        "severity": "major",
-                        "description": "新增逻辑矛盾",
-                        "location": "第二段",
-                    }
-                ],
-            },
-            ensure_ascii=False,
-        )
-    ]
-
-    result = await agent._self_verify(
-        original_content="第一段。第二段：A。",
-        revised_content="第一段。第二段：非A。",
-        fixes=[{"fix_type": "in_place", "description": "修改A"}],
-    )
-    assert result["has_new_issue"] is True
-    assert len(result["new_issues"]) == 1
-    assert result["new_issues"][0]["description"] == "新增逻辑矛盾"
-
-
-@pytest.mark.asyncio
-async def test_self_verify_no_change(agent):
-    result = await agent._self_verify(
-        original_content="same",
-        revised_content="same",
-        fixes=[],
-    )
-    assert result["has_new_issue"] is False
-    assert result["new_issues"] == []
-    assert agent.policy.call_count == 0
-
-
-# ---------------------------------------------------------------------------
 # Full run
 # ---------------------------------------------------------------------------
 
@@ -245,21 +201,11 @@ async def test_run_no_issues():
 
 
 @pytest.mark.asyncio
-async def test_run_with_issues_records_self_verify():
+async def test_run_with_issues_uses_one_repair_call():
     responses = [
         # fix removal
         json.dumps(
             {"content": "修正后的报告。", "changes": "删除错误论断"},
-            ensure_ascii=False,
-        ),
-        # self-verify
-        json.dumps(
-            {
-                "has_new_issue": True,
-                "new_issues": [
-                    {"severity": "minor", "description": "语气稍硬", "location": "第一段"}
-                ],
-            },
             ensure_ascii=False,
         ),
     ]
@@ -289,7 +235,8 @@ async def test_run_with_issues_records_self_verify():
     metadata = result.metadata
     assert metadata["dimension"] == "hallucination"
     assert len(metadata["fixes"]) == 1
-    assert len(metadata["self_verify_new_issues"]) == 1
+    assert "self_verify_new_issues" not in metadata
+    assert agent.policy.call_count == 1
     # trajectory 只保留可展示事件（role/content），内部数据走 metadata
     assert all(step.get("role") for step in result.trajectory)
 
@@ -400,7 +347,7 @@ async def test_run_search_issue_uses_function_calling():
         # second call: model returns the fixed report
         FakeLLMResponse(
             content=json.dumps(
-                {"content": "AI 监管政策仍在演进[1]。", "changes": "补充来源并软化表述"},
+                {"content": "AI 监管政策仍在演进。", "changes": "补充来源并软化表述"},
                 ensure_ascii=False,
             )
         ),
@@ -434,7 +381,15 @@ async def test_run_search_issue_uses_function_calling():
     )
 
     assert result.status == AgentStatus.SUCCESS
-    assert result.output.content == "AI 监管政策仍在演进[1]。"
+    assert result.output.content == "AI 监管政策仍在演进。"
+    assert result.output.sources == [
+        {
+            "url": "https://example.com/source",
+            "title": "Result for AI safety regulation 2024",
+            "snippet": "supporting snippet",
+            "task_id": "blue_agent",
+        }
+    ]
     assert policy.call_count == 2
     assert web_search_tool.last_query == "AI safety regulation 2024"
     assert web_search_tool.last_num_results == 3

@@ -180,7 +180,7 @@ adversarial:
   # M5: Red-Blue Adversarial Loop 配置
   # 总开关：是否启用对抗降噪流程
   enabled: false
-  # Red-Blue 对抗最大轮数
+  # Blue 最大修复轮数；每次修复后会额外执行一次 Red 复评，确保最终分数对应最终报告
   max_rounds: 5
   # 报告整体质量分阈值（Red 五维加权评分），达到此分即可提前终止对抗
   score_threshold: 9.0

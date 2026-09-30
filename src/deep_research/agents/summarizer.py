@@ -17,6 +17,7 @@ import re
 from typing import Any
 
 from ..core.schema import AgentResult, AgentStatus, ResearchReport, SubTask
+from ..core.report_content import strip_reference_sections
 from .base_agent import BaseAgent
 
 
@@ -121,12 +122,13 @@ class SummarizerAgent(BaseAgent):
             "你的任务是将多个研究发现整合成一篇连贯、结构清晰的研究报告。"
             "不要描述你将要做什么——直接输出合成后的报告。\n\n"
             "<format>\n"
-            "1. 使用 Markdown 格式，明确引用来源。\n"
+            "1. 使用 Markdown 格式。来源清单由程序根据检索记录统一生成；正文不得创建"
+            "『引用来源』『参考文献』『参考链接』『Sources』等章节，不得自行编造『来源 N』编号。\n"
             "2. 报告正文必须至少 3000 个中文字符（或 2000 个英文单词）。\n"
             "3. 结构：执行摘要 → 背景 → 关键发现（附细节）→ 分析 → 比较 → 影响 → 结论。\n"
             "4. 静默解决来源之间的矛盾：直接输出最终结论；数据有分歧时在行内标注"
             "（如「84.1–89.0，来源存在分歧」或「存疑」），不要描述解决过程。\n"
-            "5. 明确列出所有引用的来源。\n"
+            "5. 不要在正文末尾列出来源；程序会统一追加唯一的参考链接列表。\n"
             "6. 【强制】报告最末尾必须单独写一行：Overall Confidence: 0.XX（0-1 之间的数字）。不可省略。\n"
             "</format>\n\n"
             "<audience>\n"
@@ -254,6 +256,7 @@ class SummarizerAgent(BaseAgent):
             content,
             flags=re.IGNORECASE,
         ).rstrip()
+        content = strip_reference_sections(content)
 
         # 收集来源（从各个子结果的轨迹中提取）
         sources: list[dict] = []

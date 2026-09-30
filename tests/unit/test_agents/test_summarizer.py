@@ -106,6 +106,35 @@ async def test_synthesize_success():
 
 
 @pytest.mark.asyncio
+async def test_synthesizer_strips_llm_generated_reference_section():
+    content = """# 报告
+
+## 结论
+正文结论。
+
+## 引用来源
+1. 模型自行生成的来源
+
+Overall Confidence: 0.80
+"""
+    agent = SummarizerAgent(name="sum", policy=FakeLLMClient(content))
+    task = SubTask(id="synthesize", description="合成报告", task_type="synthesize")
+    source_result = AgentResult(
+        task_id="t1",
+        status=AgentStatus.SUCCESS,
+        output="材料",
+        confidence=1.0,
+        trajectory=[],
+    )
+
+    result = await agent.run(task, {"query": "test", "results": [source_result]})
+
+    assert "正文结论" in result.output.content
+    assert "引用来源" not in result.output.content
+    assert "模型自行生成的来源" not in result.output.content
+
+
+@pytest.mark.asyncio
 async def test_synthesize_llm_error():
     class BadClient(LLMClient):
         def __init__(self):

@@ -4,7 +4,7 @@
   - 将 issues 按 fix_type 分组，按 REMOVAL → SEARCH → IN_PLACE 顺序批量修复。
   - 同一 fix_type 的一批 issue 只调一次 LLM，SEARCH 类型启用 function calling，
     由模型自己决定 web_search 的 query 和次数（最多 2 次）。
-  - 每批修复后立即自检（_self_verify），发现新问题只记录、不回滚、不阻塞。
+  - 修复后的完整报告交给下一轮独立 Red 复评。
   - 修复时绝不编造来源或事实；无法验证的内容删除或标注 [未经证实]/[来源待补充]。
 """
 
@@ -29,6 +29,7 @@ from ..core.schema import (
     Severity,
     SubTask,
 )
+from ..core.report_content import strip_reference_sections
 from .base_agent import BaseAgent
 
 
@@ -49,7 +50,9 @@ SYSTEM_BLUE_AGENT = (
     "1. 绝不能为了修复问题而编造来源或事实。\n"
     "2. 如果信息无法验证，应删除该论断或添加 [未经证实]/[来源待补充] 标注。\n"
     "3. 每次只修改 issue 明确指向的位置，不要扩大范围。\n"
-    "4. 输出必须是严格的 JSON 格式，包含完整的修改后报告。"
+    "4. 输出必须是严格的 JSON 格式，包含完整的修改后报告。\n"
+    "5. 来源清单由程序维护。不得创建或修改引用来源/参考文献/参考链接章节，"
+    "不得自行生成『来源 N』或数字引用编号。"
 )
 
 
@@ -133,36 +136,6 @@ PROMPT_TEMPLATES: dict[FixType, str] = {
 }
 
 
-SYSTEM_SELF_VERIFY = (
-    "你是一位研究报告质量检查员。请对比修复前后的报告，判断修复是否引入了新的矛盾或错误。"
-)
-
-
-PROMPT_SELF_VERIFY = """请验证以下修复后的研究报告是否存在新引入的矛盾或错误。
-
-请按以下 JSON 格式输出：
-{
-  "has_new_issue": bool,
-  "new_issues": [
-    {
-      "severity": "critical|major|minor",
-      "description": "string",
-      "location": "string"
-    }
-  ]
-}
-
---- 原始报告 ---
-{original}
-
---- 修复后报告 ---
-{revised}
-
---- 已执行的修复 ---
-{fixes}
-"""
-
-
 # fix_type 执行优先级：先删除，再补来源，最后改措辞
 _FIX_TYPE_ORDER = {
     FixType.REMOVAL: 0,
@@ -179,10 +152,7 @@ _SEVERITY_RANK = {
 
 
 class BlueTeamAgent(BaseAgent):
-    """蓝队 Agent：按 fix_type 批量修复 issue，并在每批修复后自检。
-
-    自检发现新问题只记录，不回滚、不阻塞后续修复，避免"修 A 引入 B，修 B 引入 C"的死锁。
-    """
+    """蓝队 Agent：按 fix_type 批量修复 issue，由下一轮 Red 独立复评。"""
 
     def __init__(
         self,
@@ -256,8 +226,10 @@ class BlueTeamAgent(BaseAgent):
                 output=report,
                 trajectory=[
                     {
+                        "turn": 0,
                         "role": "assistant",
-                        "content": f"{dimension.value} 维度没有需要修复的 issue，跳过修复。",
+                        "log": True,
+                        "content": "本批次没有需要修复的 issue，跳过修复。",
                     }
                 ],
                 token_usage=0,
@@ -267,20 +239,28 @@ class BlueTeamAgent(BaseAgent):
 
         current_report = copy.deepcopy(report)
         fixes: list[dict[str, Any]] = []
-        new_issues_log: list[dict[str, Any]] = []
+
+        # 按 fix_type 分组批量修复：先删除、再补来源、最后改措辞
+        fix_type_groups = self._group_by_fix_type(filtered_issues)
+        ordered_fix_types = sorted(fix_type_groups.keys(), key=lambda ft: _FIX_TYPE_ORDER.get(ft, 99))
+        batch_desc = "、".join(f"{ft.value}×{len(fix_type_groups[ft])}" for ft in ordered_fix_types)
+
         trajectory: list[dict[str, Any]] = [
             {
+                "turn": 0,
                 "role": "assistant",
+                "log": True,
                 "content": (
-                    f"收到 {dimension.value} 维度修复任务：基于当前报告"
-                    f"（{len(report.content)} 字符）修复 {len(filtered_issues)} 个 issue。"
+                    f"收到修复任务：{len(ordered_fix_types)} 个批次（{batch_desc}），"
+                    f"共 {len(filtered_issues)} 个 issue，基于当前报告（{len(report.content)} 字符）。"
                 ),
             },
             {
+                "turn": 0,
                 "role": "tool",
                 "name": "blue_input",
                 "result": {
-                    "dimension": dimension.value,
+                    "fix_type_batches": {ft.value: len(fix_type_groups[ft]) for ft in ordered_fix_types},
                     "report_length": len(report.content),
                     "issue_count": len(filtered_issues),
                     "issues": filtered_issues,
@@ -290,19 +270,21 @@ class BlueTeamAgent(BaseAgent):
         token_usage = 0
 
         try:
-            # 按 fix_type 分组批量修复：先删除、再补来源、最后改措辞
-            fix_type_groups = self._group_by_fix_type(filtered_issues)
-
-            for fix_type in sorted(fix_type_groups.keys(), key=lambda ft: _FIX_TYPE_ORDER.get(ft, 99)):
+            for batch_idx, fix_type in enumerate(ordered_fix_types):
                 group = self._sort_group_by_severity(fix_type_groups[fix_type])
                 original_content = current_report.content
+                batch_turn = batch_idx + 1
 
                 fix_result = await self._apply_fix_batch(
                     current_report, group, query, dimension
                 )
                 token_usage += fix_result.get("token_usage", 0)
 
-                current_report.content = fix_result["content"]
+                current_report.content = strip_reference_sections(fix_result["content"])
+                current_report.sources = self._merge_sources(
+                    current_report.sources,
+                    fix_result.get("sources", []),
+                )
                 fix_record = {
                     "dimension": dimension.value,
                     "fix_type": fix_type.value,
@@ -312,7 +294,9 @@ class BlueTeamAgent(BaseAgent):
                 fixes.append(fix_record)
                 trajectory.append(
                     {
+                        "turn": batch_turn,
                         "role": "assistant",
+                        "log": True,
                         "content": (
                             f"批次修复 [{fix_type.value}]：处理 {len(group)} 个 issue，"
                             f"报告长度 {len(original_content)} → {len(current_report.content)}。"
@@ -330,63 +314,32 @@ class BlueTeamAgent(BaseAgent):
                     fix_result.get("changes", "")[:100],
                 )
 
-                # 每批修复完立即自检
-                verify_result = await self._self_verify(
-                    original_content=original_content,
-                    revised_content=current_report.content,
-                    fixes=fixes,
-                )
-                token_usage += verify_result.get("token_usage", 0)
-                trajectory.append(
-                    {
-                        "role": "tool",
-                        "name": "self_verify",
-                        "result": {
-                            "has_new_issue": verify_result.get("has_new_issue", False),
-                            "new_issues": verify_result.get("new_issues", []),
-                        },
-                    }
-                )
-
-                if verify_result.get("has_new_issue"):
-                    logger.warning(
-                        "BlueTeamAgent 批量修复 %s 后自检发现 %d 个新问题",
-                        fix_type.value,
-                        len(verify_result.get("new_issues", [])),
-                    )
-                    new_issues_log.extend(
-                        {
-                            "triggered_by": fix_record,
-                            "new_issue": ni,
-                        }
-                        for ni in verify_result.get("new_issues", [])
-                    )
-
             logger.info(
-                "BlueTeamAgent: 维度 %s 完成 %d 批 issue 修复（共 %d 个），自检记录 %d 个新问题",
+                "BlueTeamAgent: 维度 %s 完成 %d 批 issue 修复（共 %d 个）",
                 dimension.value,
                 len(fixes),
                 len(filtered_issues),
-                len(new_issues_log),
             )
 
+            summary_turn = len(fixes) + 1
             trajectory.append(
                 {
+                    "turn": summary_turn,
                     "role": "assistant",
+                    "log": True,
                     "content": (
-                        f"{dimension.value} 维度修复完成：{len(fixes)} 批修复"
-                        f"（共 {len(filtered_issues)} 个 issue），"
-                        f"自检发现 {len(new_issues_log)} 个新问题。"
+                        f"修复完成：{len(fixes)} 批修复"
+                        f"（共 {len(filtered_issues)} 个 issue）。"
                     ),
                 }
             )
             trajectory.append(
                 {
+                    "turn": summary_turn,
                     "role": "tool",
                     "name": "blue_fixes",
                     "result": {
                         "fixes": fixes,
-                        "self_verify_new_issues": new_issues_log,
                     },
                 }
             )
@@ -401,7 +354,6 @@ class BlueTeamAgent(BaseAgent):
                 metadata={
                     "dimension": dimension.value,
                     "fixes": fixes,
-                    "self_verify_new_issues": new_issues_log,
                 },
             )
 
@@ -412,7 +364,7 @@ class BlueTeamAgent(BaseAgent):
                 status=AgentStatus.FAILED,
                 output=f"Blue repair failed: {type(e).__name__}: {e}",
                 trajectory=[
-                    {"role": "assistant", "content": f"修复失败：{type(e).__name__}: {e}"}
+                    {"turn": 0, "role": "assistant", "log": True, "content": f"修复失败：{type(e).__name__}: {e}"}
                 ],
                 token_usage=token_usage,
                 confidence=report.confidence,
@@ -487,7 +439,7 @@ class BlueTeamAgent(BaseAgent):
             messages = self._build_repair_messages(
                 report, issues, query, dimension, web_search_tool
             )
-            content, token_usage = await self._run_repair_loop(
+            content, token_usage, new_sources = await self._run_repair_loop(
                 messages, fix_type, web_search_tool, query
             )
 
@@ -501,6 +453,7 @@ class BlueTeamAgent(BaseAgent):
                 "content": parsed.get("content", report.content),
                 "changes": parsed.get("changes", ""),
                 "token_usage": token_usage,
+                "sources": new_sources,
             }
 
         finally:
@@ -598,10 +551,11 @@ class BlueTeamAgent(BaseAgent):
         web_search_tool: Any | None,
         query: str,
         max_tool_turns: int = 2,
-    ) -> tuple[str, int]:
+    ) -> tuple[str, int, list[dict[str, Any]]]:
         """运行修复 LLM 调用循环，处理可选的 function calling。"""
         total_token_usage = 0
         content = ""
+        collected_sources: list[dict[str, Any]] = []
 
         for turn in range(max_tool_turns + 1):
             resp = await asyncio.to_thread(self.policy.chat, messages)
@@ -625,7 +579,9 @@ class BlueTeamAgent(BaseAgent):
                 {"role": "assistant", "content": content, "tool_calls": tool_calls}
             )
 
-            await self._execute_tool_calls(tool_calls, web_search_tool, messages, query)
+            collected_sources.extend(
+                await self._execute_tool_calls(tool_calls, web_search_tool, messages, query)
+            )
 
             # 提示模型基于搜索结果继续
             messages.append({
@@ -633,7 +589,7 @@ class BlueTeamAgent(BaseAgent):
                 "content": "搜索结果已返回，请基于上述结果继续修复并输出 JSON。",
             })
 
-        return content, total_token_usage
+        return content, total_token_usage, collected_sources
 
     async def _execute_tool_calls(
         self,
@@ -641,8 +597,9 @@ class BlueTeamAgent(BaseAgent):
         web_search_tool: Any | None,
         messages: list[dict[str, Any]],
         query: str,
-    ) -> None:
+    ) -> list[dict[str, Any]]:
         """执行一批 tool_calls，把结果以 tool 消息形式追加到 messages。"""
+        collected_sources: list[dict[str, Any]] = []
         for tc in tool_calls:
             func = tc.get("function", {})
             tool_name = func.get("name", "")
@@ -676,6 +633,12 @@ class BlueTeamAgent(BaseAgent):
             else:
                 result = await web_search_tool.execute(search_query, num_results=num_results)
 
+            if isinstance(result, list):
+                collected_sources.extend(
+                    item for item in result
+                    if isinstance(item, dict) and item.get("url")
+                )
+
             # 对搜索结果做 L2 压缩，避免上下文爆炸
             current_tokens = sum(len(str(m.get("content", ""))) for m in messages) // 3
             budget = self.config.get("compressor", {}).get("max_context_length", 128000)
@@ -690,49 +653,7 @@ class BlueTeamAgent(BaseAgent):
                 "content": json.dumps(result, ensure_ascii=False, default=str),
             })
 
-    async def _self_verify(
-        self,
-        original_content: str,
-        revised_content: str,
-        fixes: list[dict[str, Any]],
-    ) -> dict[str, Any]:
-        """对比修复前后内容，检查是否引入新问题。
-
-        发现新问题只返回记录，不阻塞、不回滚。
-        """
-        if original_content == revised_content:
-            return {"has_new_issue": False, "new_issues": [], "token_usage": 0}
-
-        fixes_text = json.dumps(fixes, ensure_ascii=False, indent=2)
-        user_prompt = self._format_prompt(
-            PROMPT_SELF_VERIFY,
-            original=original_content,
-            revised=revised_content,
-            fixes=fixes_text,
-        )
-
-        messages = [
-            {"role": "system", "content": SYSTEM_SELF_VERIFY},
-            {"role": "user", "content": user_prompt},
-        ]
-
-        logger.info("BlueTeamAgent 开始自检 LLM")
-        try:
-            resp = await asyncio.to_thread(self.policy.chat, messages)
-            logger.info("BlueTeamAgent 自检 LLM 调用返回")
-            content = resp.content or ""
-            token_usage = getattr(resp, "usage", None)
-            token_usage = token_usage.total_tokens if token_usage else 0
-        except Exception:
-            logger.exception("BlueTeamAgent 自检 LLM 调用失败")
-            return {"has_new_issue": False, "new_issues": [], "token_usage": 0}
-
-        parsed = self._parse_verify_json(content)
-        return {
-            "has_new_issue": bool(parsed.get("has_new_issue", False)),
-            "new_issues": parsed.get("new_issues", []),
-            "token_usage": token_usage,
-        }
+        return collected_sources
 
     def _get_tool(self, name: str) -> Any | None:
         """按名称获取已注册的工具实例。"""
@@ -752,6 +673,27 @@ class BlueTeamAgent(BaseAgent):
             snippet = s.get("snippet", "")
             lines.append(f"[{i}] {title}\nURL: {url}\n摘要: {snippet}\n")
         return "\n".join(lines)
+
+    def _merge_sources(
+        self,
+        existing: list[dict],
+        discovered: list[dict],
+    ) -> list[dict]:
+        """Merge tool-discovered sources into report metadata, deduplicated by URL."""
+        merged = list(existing or [])
+        seen = {str(source.get("url", "")).strip() for source in merged}
+        for source in discovered or []:
+            url = str(source.get("url", "")).strip()
+            if not url or url in seen:
+                continue
+            merged.append({
+                "url": url,
+                "title": str(source.get("title", "")),
+                "snippet": str(source.get("snippet", "")),
+                "task_id": "blue_agent",
+            })
+            seen.add(url)
+        return merged
 
     def _format_prompt(self, template: str, **kwargs) -> str:
         """安全格式化 prompt：转义 JSON 中的花括号，只保留已知占位符。"""
@@ -823,27 +765,6 @@ class BlueTeamAgent(BaseAgent):
                 logger.warning("BlueTeamAgent 修复 JSON 解码失败: %s", e)
                 return {}
         return data if isinstance(data, dict) else {}
-
-    def _parse_verify_json(self, text: str) -> dict[str, Any]:
-        """解析自检 LLM 的 JSON 输出。"""
-        raw = self._extract_json(text)
-        try:
-            data = json.loads(raw) if raw is not None else json_repair_loads(text)
-        except json.JSONDecodeError as e:
-            try:
-                data = json_repair_loads(raw if raw is not None else text)
-            except Exception:
-                logger.warning("BlueTeamAgent 自检 JSON 解码失败: %s", e)
-                return {"has_new_issue": False, "new_issues": []}
-        if not isinstance(data, dict):
-            return {"has_new_issue": False, "new_issues": []}
-        new_issues = data.get("new_issues", [])
-        if not isinstance(new_issues, list):
-            new_issues = []
-        return {
-            "has_new_issue": bool(data.get("has_new_issue", False)) and len(new_issues) > 0,
-            "new_issues": new_issues,
-        }
 
     def _extract_json(self, text: str) -> str | None:
         """从文本中提取第一个 JSON 对象。

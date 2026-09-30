@@ -1,6 +1,7 @@
 """Orchestrator — sole controller of the workflow state machine."""
 
 import asyncio
+import copy
 import json
 import logging
 import uuid
@@ -208,7 +209,9 @@ class Orchestrator:
         self._emit("agent_loop_event", {
             "task_id": task_id,
             "event": {
+                "turn": 0,
                 "role": "assistant",
+                "log": True,
                 "content": (
                     f"第 {round_no} 轮汇总：加权总评分 {red_result.overall_score:.2f}/10；"
                     f"原始 issue {len(all_issues)} 个，合并去重后 {len(merged_issues)} 个；"
@@ -219,6 +222,7 @@ class Orchestrator:
         self._emit("agent_loop_event", {
             "task_id": task_id,
             "event": {
+                "turn": 0,
                 "role": "tool",
                 "name": "issue_merger",
                 "result": {**summary, "merged_issues": merged_issues},
@@ -720,10 +724,11 @@ class Orchestrator:
         """ADVERSARIAL：5 维 Red 并发攻击 + IssueMerger 合并仲裁 + Blue 按 fix_type 批量修复。
 
         每轮流程：
-          1. 并发调用 5 个维度的 Red Agent。
-          2. 用 IssueMerger（rule-based + 可选 LLM 仲裁）合并、去重、消解冲突。
-          3. 按 REMOVAL → SEARCH → IN_PLACE 顺序批量调用 Blue Agent 修复。
-          4. 计算 overall_score，检查终止条件。
+          1. 并发调用 5 个维度的 Red Agent，对当前报告评分。
+          2. 评分达标/无问题/震荡/不再提升时直接终止（评的就是当前报告，分数与制品一致）。
+          3. 否则用 IssueMerger（rule-based + 可选 LLM 仲裁）合并去重，按 REMOVAL → SEARCH → IN_PLACE 分批修复。
+        循环最多 max_rounds 次修复，之后追加一轮只评不修的 Red 复评。
+        循环结束后若历史最佳版本的分数高于最终版本，回退到最佳版本交付。
         """
         report = self._report
         if report is None:
@@ -761,9 +766,16 @@ class Orchestrator:
         history: list[dict] = []
         historical_issues: list[dict] = []
         prev_score = 0.0
+        # 最佳版本快照：每轮 Red 评分对应的是本轮修复前的报告，
+        # 若后续轮次的修复反而拉低分数，循环结束后回退到历史最佳版本交付
+        best_score = -1.0
+        best_report: Any | None = None
+        best_round = 0
 
-        for round_no in range(1, max_rounds + 1):
-            logger.info("开始第 %d/%d 轮对抗优化", round_no, max_rounds)
+        # max_rounds 限制 Blue 修复次数。由于每次修复后的报告都必须再由 Red
+        # 评分，循环最多包含 max_rounds + 1 次 Red 评估；最后一次只评估、不修复。
+        for round_no in range(1, max_rounds + 2):
+            logger.info("开始第 %d 轮对抗评估（最多修复 %d 轮）", round_no, max_rounds)
             dimension_attacks: dict[AttackDimension, DimensionAttack] = {}
 
             # 1. 五个维度并发 Red 攻击
@@ -812,58 +824,14 @@ class Orchestrator:
             red_result.overall_score = overall_score
             red_result.overall_summary = self._build_red_summary(dimension_attacks)
 
-            round_blue_fixes: list[dict] = []
-            round_blue_new_issues: list[dict] = []
-            if all_issues:
-                merged_issues = await IssueMerger.merge_issues(
-                    all_issues,
-                    llm_client=self.issue_arbiter_client,
-                    query=self._query,
-                    report_content=report.content,
-                )
-                logger.info(
-                    "第 %d 轮 - Red 共发现 %d 个问题，合并后剩余 %d 个",
-                    round_no,
-                    len(all_issues),
-                    len(merged_issues),
-                )
-            else:
-                merged_issues = []
-                logger.info("第 %d 轮 - 无突出问题，跳过修复", round_no)
+            # 在本轮 Blue 修复前打快照：overall_score 评的是当前这个版本的报告
+            if overall_score > best_score:
+                best_score = overall_score
+                best_report = copy.deepcopy(report)
+                best_round = round_no
 
-            # 按 fix_type 分组
-            fix_type_groups: dict[FixType, list[Issue]] = defaultdict(list)
-            for issue in merged_issues:
-                fix_type_groups[issue.fix_type].append(issue)
-
-            # 汇总节点：让时间线能看到结构化攻击结果与分发去向
-            self._emit_merge_summary(round_no, red_result, all_issues, merged_issues, fix_type_groups)
-
-            if merged_issues:
-                # 按 fix_type 保守程度排序：先删除，再补来源，最后改措辞
-                fix_type_order = {FixType.REMOVAL: 0, FixType.SEARCH: 1, FixType.IN_PLACE: 2}
-                for fix_type in sorted(fix_type_groups.keys(), key=lambda ft: fix_type_order.get(ft, 99)):
-                    group = fix_type_groups[fix_type]
-                    try:
-                        blue_result = await self._run_blue_agent(report, group[0].dimension, group)
-                    except Exception:
-                        logger.exception(
-                            "Blue Agent 批量修复 %s 类型失败", fix_type.value
-                        )
-                        return WorkflowState.FAILED
-                    if not isinstance(blue_result.output, ResearchReport):
-                        logger.error("Blue Agent 返回类型错误: %s", type(blue_result.output))
-                        return WorkflowState.FAILED
-
-                    report = blue_result.output
-                    if blue_result.metadata:
-                        round_blue_fixes.extend(blue_result.metadata.get("fixes", []))
-                        round_blue_new_issues.extend(
-                            blue_result.metadata.get("self_verify_new_issues", [])
-                        )
-
-            # 3. 汇总本轮突出问题（评分已在第 2 步计算）
-
+            # 2. 先依据 Red 结果决定是否需要修复。评分和问题均对应当前 report，
+            # 因此达标时必须在 Blue 修改前退出，避免最终报告与 final_score 不一致。
             outstanding = red_result.outstanding_issues(min_severity)
             current_issue_dicts = [
                 {
@@ -892,19 +860,10 @@ class Orchestrator:
                     for d, da in dimension_attacks.items()
                 },
                 "outstanding_issues": current_issue_dicts,
-                "blue_fixes": round_blue_fixes,
-                "blue_new_issues": round_blue_new_issues,
+                "blue_fixes": [],
             })
 
-            logger.info(
-                "第 %d 轮 Blue 修复完成：%d 批修复，自检发现 %d 个新问题，报告长度 %d 字符",
-                round_no,
-                len(round_blue_fixes),
-                len(round_blue_new_issues),
-                len(report.content),
-            )
-
-            # 终止条件 1：评分达到目标阈值
+            # 终止条件 1：评分达到目标阈值，不再调用 Blue
             if overall_score >= score_threshold:
                 logger.info(
                     "报告整体评分 %.2f 达到阈值 %.2f，对抗结束",
@@ -913,12 +872,12 @@ class Orchestrator:
                 )
                 break
 
-            # 终止条件 3：无突出问题
+            # 终止条件 2：无突出问题
             if not outstanding:
                 logger.info("Red 未发现需修复的突出问题，对抗提前结束")
                 break
 
-            # 终止条件 4：Issue 震荡检测
+            # 终止条件 3：Issue 震荡检测
             if enable_oscillation_check and historical_issues:
                 oscillated = [
                     issue for issue in current_issue_dicts
@@ -933,27 +892,104 @@ class Orchestrator:
                     history[-1]["oscillated_issues"] = oscillated
                     break
 
-            # 累积历史 issue 用于下一轮震荡检测
-            historical_issues.extend(current_issue_dicts)
-
-            # 终止条件 5：相邻轮评分变化收敛
-            if round_no > 1 and abs(overall_score - prev_score) < delta_threshold:
+            # 终止条件 4：评分不再明显提升（含下降）即收敛；
+            # 不能用 abs()——分数下降说明修复在帮倒忙，更应该停
+            if round_no > 1 and (overall_score - prev_score) < delta_threshold:
                 logger.info(
-                    "评分变化 %.2f 小于阈值 %.2f，对抗收敛",
-                    abs(overall_score - prev_score),
+                    "评分提升 %.2f 小于阈值 %.2f（或无提升），对抗收敛",
+                    overall_score - prev_score,
                     delta_threshold,
                 )
                 break
+
+            # max_rounds 次 Blue 修复已用完。当前轮是最后一次修复后的 Red
+            # 复评，只记录真实最终分数，不再产生未经复评的新修改。
+            if round_no > max_rounds:
+                logger.info("已完成 %d 轮 Blue 修复及最终 Red 复评，对抗结束", max_rounds)
+                history[-1]["final_verification"] = True
+                break
+
+            historical_issues.extend(current_issue_dicts)
             prev_score = overall_score
 
-        # 更新最终报告
+            # 3. 未达标时才合并问题，并按 fix_type 分发给 Blue 修复
+            round_blue_fixes: list[dict] = []
+            merged_issues = await IssueMerger.merge_issues(
+                all_issues,
+                llm_client=self.issue_arbiter_client,
+                query=self._query,
+                report_content=report.content,
+            )
+            logger.info(
+                "第 %d 轮 - Red 共发现 %d 个问题，合并后剩余 %d 个",
+                round_no,
+                len(all_issues),
+                len(merged_issues),
+            )
+
+            fix_type_groups: dict[FixType, list[Issue]] = defaultdict(list)
+            for issue in merged_issues:
+                fix_type_groups[issue.fix_type].append(issue)
+
+            self._emit_merge_summary(round_no, red_result, all_issues, merged_issues, fix_type_groups)
+
+            # 按 fix_type 保守程度排序：先删除，再补来源，最后改措辞
+            fix_type_order = {FixType.REMOVAL: 0, FixType.SEARCH: 1, FixType.IN_PLACE: 2}
+            for fix_type in sorted(fix_type_groups.keys(), key=lambda ft: fix_type_order.get(ft, 99)):
+                group = fix_type_groups[fix_type]
+                try:
+                    blue_result = await self._run_blue_agent(report, group[0].dimension, group)
+                except Exception:
+                    logger.exception("Blue Agent 批量修复 %s 类型失败", fix_type.value)
+                    return WorkflowState.FAILED
+                if not isinstance(blue_result.output, ResearchReport):
+                    logger.error("Blue Agent 返回类型错误: %s", type(blue_result.output))
+                    return WorkflowState.FAILED
+
+                report = blue_result.output
+                if blue_result.metadata:
+                    round_blue_fixes.extend(blue_result.metadata.get("fixes", []))
+
+            history[-1]["blue_fixes"] = round_blue_fixes
+            logger.info(
+                "第 %d 轮 Blue 修复完成：%d 批修复，报告长度 %d 字符",
+                round_no,
+                len(round_blue_fixes),
+                len(report.content),
+            )
+
+        # 更新最终报告：若后续轮次的修复反而拉低了分数，回退到历史最佳版本交付，
+        # 保证交付的报告与 final_score 一致
+        final_round_score = history[-1]["red_overall_score"] if history else 0.0
+        if history:
+            history[-1]["best_round"] = best_round
+            history[-1]["best_score"] = best_score
+        if best_report is not None and best_score > final_round_score:
+            logger.info(
+                "历史最佳版本出现在第 %d 轮（%.2f > %.2f），回退到该版本交付",
+                best_round,
+                best_score,
+                final_round_score,
+            )
+            if history:
+                history[-1]["restored_best"] = True
+            report = best_report
+            delivered_score = best_score
+            delivered_dimension_scores = {
+                d: history[best_round - 1]["red_dimension_scores"].get(d.value, 0.0)
+                for d in AttackDimension
+            }
+        else:
+            delivered_score = final_round_score
+            delivered_dimension_scores = {
+                d: history[-1]["red_dimension_scores"].get(d.value, 0.0)
+                for d in AttackDimension
+            } if history else {}
+
         report.adversarial_rounds = len(history)
-        report.final_score = history[-1]["red_overall_score"] if history else 0.0
+        report.final_score = delivered_score
         report.adversarial_history = history
-        report.dimension_scores = {
-            d: history[-1]["red_dimension_scores"].get(d.value, 0.0)
-            for d in AttackDimension
-        } if history else {}
+        report.dimension_scores = delivered_dimension_scores
         self._report = report
 
         logger.info(
@@ -1257,7 +1293,6 @@ class Orchestrator:
                     {
                         "round": round_no,
                         "fixes": record.get("blue_fixes", []),
-                        "self_verify_new_issues": record.get("blue_new_issues", []),
                     },
                     ensure_ascii=False,
                     indent=2,
