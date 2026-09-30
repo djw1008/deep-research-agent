@@ -1,6 +1,8 @@
 from deep_research.core.report_content import (
+    citation_ids,
     invalid_citation_ids,
     prepare_sources,
+    remap_citation_ids,
     remove_invalid_citations,
     strip_reference_sections,
 )
@@ -32,3 +34,10 @@ def test_reference_section_is_removed_but_inline_citations_remain():
     content = "正文结论 [1]。\n\n## 参考文献\n1. Example"
 
     assert strip_reference_sections(content) == "正文结论 [1]。"
+
+
+def test_citation_ids_can_be_extracted_and_remapped():
+    content = "已有 [1]，候选 [4]，重复候选 [4]。"
+
+    assert citation_ids(content) == {1, 4}
+    assert remap_citation_ids(content, {4: 2}) == "已有 [1]，候选 [2]，重复候选 [2]。"

@@ -347,7 +347,7 @@ async def test_run_search_issue_uses_function_calling():
         # second call: model returns the fixed report
         FakeLLMResponse(
             content=json.dumps(
-                {"content": "AI 监管政策仍在演进。", "changes": "补充来源并软化表述"},
+                {"content": "AI 监管政策仍在演进 [1]。", "changes": "补充来源并软化表述"},
                 ensure_ascii=False,
             )
         ),
@@ -381,7 +381,7 @@ async def test_run_search_issue_uses_function_calling():
     )
 
     assert result.status == AgentStatus.SUCCESS
-    assert result.output.content == "AI 监管政策仍在演进。"
+    assert result.output.content == "AI 监管政策仍在演进 [1]。"
     assert result.output.sources == [
         {
             "url": "https://example.com/source",
@@ -396,3 +396,22 @@ async def test_run_search_issue_uses_function_calling():
     assert web_search_tool.last_num_results == 3
     # SEARCH 完成后应清理工具 schema，避免影响后续调用
     assert policy.tools is None
+
+
+def test_only_cited_new_sources_are_registered_and_numbers_are_compacted(agent):
+    existing = [
+        {"title": "Existing", "url": "https://example.com/existing", "citation_id": 1}
+    ]
+    discovered = [
+        {"title": "Filtered", "url": "https://example.com/filtered", "citation_id": 2},
+        {"title": "Used", "url": "https://example.com/used", "citation_id": 3},
+    ]
+
+    content, selected = agent._select_cited_new_sources(
+        "保留旧来源 [1]，使用新来源 [3]。",
+        existing,
+        discovered,
+    )
+
+    assert content == "保留旧来源 [1]，使用新来源 [2]。"
+    assert [source["url"] for source in selected] == ["https://example.com/used"]

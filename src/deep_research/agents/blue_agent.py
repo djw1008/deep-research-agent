@@ -30,7 +30,9 @@ from ..core.schema import (
     SubTask,
 )
 from ..core.report_content import (
+    citation_ids,
     prepare_sources,
+    remap_citation_ids,
     remove_invalid_citations,
     strip_reference_sections,
 )
@@ -451,16 +453,21 @@ class BlueTeamAgent(BaseAgent):
             )
 
             parsed = self._parse_fix_json(content)
+            revised_content, cited_new_sources = self._select_cited_new_sources(
+                parsed.get("content", report.content),
+                report.sources,
+                new_sources,
+            )
             logger.info(
                 "BlueTeamAgent %s 修复 LLM 输出解析完成：changes=%s",
                 fix_type.value,
                 parsed.get("changes", "")[:100],
             )
             return {
-                "content": parsed.get("content", report.content),
+                "content": revised_content,
                 "changes": parsed.get("changes", ""),
                 "token_usage": token_usage,
-                "sources": new_sources,
+                "sources": cited_new_sources,
             }
 
         finally:
@@ -724,6 +731,31 @@ class BlueTeamAgent(BaseAgent):
             for source in discovered or []
         ]
         return prepare_sources(list(existing or []) + normalized_discovered)
+
+    def _select_cited_new_sources(
+        self,
+        content: str,
+        existing: list[dict],
+        discovered: list[dict],
+    ) -> tuple[str, list[dict]]:
+        """Register only newly discovered sources actually cited by the repair.
+
+        Search results receive temporary numbers before L2 compression. If only
+        a subset is cited, compact those temporary numbers so the final registry
+        stays contiguous and the正文编号 remains aligned with ``report.sources``.
+        """
+        existing_count = len(prepare_sources(existing))
+        used_ids = citation_ids(content)
+        selected = [
+            source for source in prepare_sources(list(existing) + list(discovered))[existing_count:]
+            if int(source["citation_id"]) in used_ids
+        ]
+        mapping = {
+            int(source["citation_id"]): existing_count + index
+            for index, source in enumerate(selected, 1)
+        }
+        remapped_content = remap_citation_ids(content, mapping)
+        return remapped_content, selected
 
     def _format_prompt(self, template: str, **kwargs) -> str:
         """安全格式化 prompt：转义 JSON 中的花括号，只保留已知占位符。"""

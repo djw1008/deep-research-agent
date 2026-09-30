@@ -47,8 +47,23 @@ def prepare_sources(sources: list[dict[str, Any]]) -> list[dict[str, Any]]:
 def invalid_citation_ids(content: str, sources: list[dict[str, Any]]) -> set[int]:
     """Return numeric citations in content that do not exist in the registry."""
     valid_ids = {int(source["citation_id"]) for source in sources if source.get("citation_id")}
-    used_ids = {int(match) for match in _CITATION.findall(content or "")}
+    used_ids = citation_ids(content)
     return used_ids - valid_ids
+
+
+def citation_ids(content: str) -> set[int]:
+    """Return all numeric citation identifiers used in report content."""
+    return {int(match) for match in _CITATION.findall(content or "")}
+
+
+def remap_citation_ids(content: str, mapping: dict[int, int]) -> str:
+    """Rewrite selected numeric citation identifiers without touching others."""
+    if not mapping:
+        return content
+    return _CITATION.sub(
+        lambda match: f"[{mapping.get(int(match.group(1)), int(match.group(1)))}]",
+        content,
+    )
 
 
 def remove_invalid_citations(content: str, sources: list[dict[str, Any]]) -> str:
