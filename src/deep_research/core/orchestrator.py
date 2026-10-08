@@ -442,6 +442,13 @@ class Orchestrator:
                         if dep_result is not None:
                             output = dep_result.output
                             ctx[f"dep:{dep_id}"] = output if isinstance(output, str) else str(output)
+                            # Dependency citations are task-local.  Pass their
+                            # bindings with the text so the downstream agent can
+                            # cite them through an unambiguous task namespace.
+                            dep_sources = dep_result.metadata.get("sources", [])
+                            ctx[f"dep_sources:{dep_id}"] = (
+                                dep_sources if isinstance(dep_sources, list) else []
+                            )
 
                     # 从 AgentPool 借 Agent
                     self._emit("task_started", {
@@ -590,52 +597,22 @@ class Orchestrator:
         task_type = subtask.task_type if subtask else "search"
         task_description = subtask.description if subtask else ""
 
-        # 从 trajectory 中提取引用来源
-        sources: list[dict] = []
-        for step in result.trajectory:
-            if step.get("role") != "tool":
-                continue
-            res = step.get("result")
-            if isinstance(res, list):
-                for item in res:
-                    if isinstance(item, dict) and "url" in item:
-                        sources.append({
-                            "url": item["url"],
-                            "title": item.get("title", ""),
-                            "snippet": item.get("snippet", ""),
-                            "task_id": result.task_id,
-                        })
-            elif isinstance(res, dict):
-                if "results" in res and isinstance(res["results"], list):
-                    for item in res["results"]:
-                        if isinstance(item, dict) and "url" in item:
-                            sources.append({
-                                "url": item["url"],
-                                "title": item.get("title", ""),
-                                "snippet": item.get("snippet", ""),
-                                "task_id": result.task_id,
-                            })
-                elif "papers" in res and isinstance(res["papers"], list):
-                    for paper in res["papers"]:
-                        if isinstance(paper, dict) and "pdf_url" in paper:
-                            sources.append({
-                                "url": paper["pdf_url"],
-                                "title": paper.get("title", ""),
-                                "snippet": paper.get("summary", "")[:200],
-                                "task_id": result.task_id,
-                            })
-
-        # 去重
-        seen = set()
-        unique_sources = []
-        for s in sources:
-            key = s.get("url", "")
-            if key and key not in seen:
-                seen.add(key)
-                unique_sources.append(s)
+        # ResearchAgent 已将列表收敛为 output 实际引用的来源。
+        sources = result.metadata.get("sources", [])
+        unique_sources = (
+            [
+                dict(source)
+                for source in sources
+                if isinstance(source, dict) and str(source.get("url", "")).strip()
+            ]
+            if isinstance(sources, list)
+            else []
+        )
 
         try:
             metadata = dict(result.metadata or {})
+            # sources 有独立存储列，不在 metadata 中重复保存。
+            metadata.pop("sources", None)
             metadata.update({
                 "token_usage": result.token_usage,
                 "status": result.status.value,
@@ -1087,6 +1064,7 @@ class Orchestrator:
                         query=self._query,
                         dag=dag_dict,
                         report=report_content,
+                        sources=list(getattr(self._report, "sources", []) or []),
                     )
                     logger.info(
                         "Session round persisted [session=%s round=%d]",

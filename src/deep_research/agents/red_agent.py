@@ -95,7 +95,7 @@ PROMPT_HALLUCINATION = """请对以下研究报告进行【幻觉检测】评分
    - 强因果关系缺乏证据
    - 看似真实但无法从报告中推导出的细节
 2. 区分"合理推断"与"无依据断言"：推断应使用"可能"、" reportedly"等弱化表述，否则视为疑似幻觉。
-3. 本维度不做外部来源比对，只基于报告自身内容判断是否有依据支撑。
+3. 结合下方来源列表核对正文引用。引用编号存在且来源标题或摘要能够支持论断时，不得仅因来源权威性较低而判定为幻觉；来源权威性问题交由来源可信度维度处理。
 
 请按以下 JSON 格式输出（不要有任何额外文字）：
 {
@@ -116,6 +116,9 @@ Query: {query}
 
 Content:
 {content}
+
+--- 来源列表 ---
+{sources}
 """
 
 
@@ -172,6 +175,7 @@ PROMPT_SOURCE_CREDIBILITY = """请对以下研究报告的【来源可信度】�
 4. 检查一手程度：优先一手数据，二手分析需标注原始来源。
 5. 核对正文中的数字引用 [N] 是否存在于下方去重来源列表，并判断该来源的标题、摘要与附近论断是否匹配。
 6. 关键事实或精确数字缺少正文引用时，应降低来源可信度评分并报告具体位置。
+7. 必须区分三种情况：没有来源、来源不支持论断、来源支持论断但权威性较低。第三种仅属于来源质量问题，不能判定为幻觉或无依据；可建议保留引用并注明来源性质，或寻找更权威来源交叉验证。
 
 请按以下 JSON 格式输出（不要有任何额外文字）：
 {
@@ -385,8 +389,8 @@ class RedTeamAgent(BaseAgent):
         template = PROMPT_TEMPLATES[dimension]
         sources_text = self._format_sources(report.sources)
 
-        # 只有 source 维度需要完整 sources；其他维度做轻量级内部审查
-        if dimension == AttackDimension.SOURCE:
+        # 幻觉和来源维度需要核对引用；其他维度只做轻量级内部审查
+        if dimension in {AttackDimension.HALLUCINATION, AttackDimension.SOURCE}:
             user_prompt = self._format_prompt(
                 template, query=query, content=report.content, sources=sources_text
             )

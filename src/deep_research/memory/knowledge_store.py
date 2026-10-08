@@ -10,11 +10,15 @@ import asyncio
 import hashlib
 import json
 import logging
+import math
 import os
+import re
 import time
+from collections import Counter
 from typing import Any
 
 import aiosqlite
+import jieba
 import numpy as np
 
 from .embedder import MemoryEmbedder
@@ -59,6 +63,11 @@ class KnowledgeBase:
     _DEFAULT_MAX_ENTRIES = 10000
     _DEFAULT_EVICT_INTERVAL = 100
     _DEFAULT_EVICTED_RETENTION_DAYS = 30
+    _EMBEDDING_SCOPE = "task_description_v2"
+    _BM25_STOPWORDS = {
+        "收集", "整理", "分析", "研究", "比较", "对比", "数据", "信息",
+        "结果", "表现", "相关", "公开", "包括", "以及", "当前", "任务",
+    }
 
     def __init__(
         self,
@@ -81,6 +90,9 @@ class KnowledgeBase:
 
         self._dedup_threshold: float = float(
             self.config.get("similarity_threshold_dup", 0.92)
+        )
+        self._bm25_min_score: float = float(
+            self.config.get("bm25_min_score", 0.75)
         )
         self._max_entries: int = self._DEFAULT_MAX_ENTRIES
         self._evict_interval: int = self._DEFAULT_EVICT_INTERVAL
@@ -115,7 +127,35 @@ class KnowledgeBase:
                     await conn.execute(stmt)
             await conn.commit()
             await self._clear_stale_embeddings_locked()
+            await self._migrate_task_description_embeddings_locked()
             await self._rebuild_index_locked()
+
+    async def _migrate_task_description_embeddings_locked(self) -> None:
+        """Re-embed legacy rows whose vectors included the shared root query."""
+        conn = await self._connect()
+        cursor = await conn.execute("SELECT id, topic, content, metadata FROM knowledge")
+        rows = await cursor.fetchall()
+        updates: list[tuple[bytes, str, str]] = []
+        for row in rows:
+            metadata = json.loads(row["metadata"]) if row["metadata"] else {}
+            if metadata.get("embedding_scope") == self._EMBEDDING_SCOPE:
+                continue
+            description = str(metadata.get("task_description") or "").strip()
+            embedding_text = description or str(row["topic"] or row["content"][:500])
+            embedding = await asyncio.to_thread(self.embedder.encode_one, embedding_text)
+            metadata["embedding_scope"] = self._EMBEDDING_SCOPE
+            updates.append((
+                embedding.astype(np.float32, copy=False).tobytes(),
+                json.dumps(metadata, ensure_ascii=False),
+                row["id"],
+            ))
+        if updates:
+            await conn.executemany(
+                "UPDATE knowledge SET embedding = ?, metadata = ? WHERE id = ?",
+                updates,
+            )
+            await conn.commit()
+            logger.info("Re-embedded %d knowledge entries by task description", len(updates))
 
     async def _clear_stale_embeddings_locked(self) -> None:
         """If existing embeddings have a different dimension, clear the table."""
@@ -230,15 +270,25 @@ class KnowledgeBase:
         if norm > 0:
             query_emb = query_emb / norm
 
-        all_sims = self._embeddings.dot(query_emb)
+        vector_scores = self._embeddings.dot(query_emb)
+        eligible_indices = [
+            idx
+            for idx, eid in enumerate(self._entry_ids)
+            if task_type is None or self._entries_cache[eid].task_type == task_type
+        ]
+        descriptions = [
+            self._entry_description(self._entries_cache[self._entry_ids[idx]])
+            for idx in eligible_indices
+        ]
+        lexical_scores = self._bm25_scores(query, descriptions)
         candidates: list[tuple[float, str]] = []
 
-        for idx, eid in enumerate(self._entry_ids):
-            entry = self._entries_cache[eid]
-            if task_type is not None and entry.task_type != task_type:
-                continue
-            score = float(all_sims[idx])
-            if score >= threshold:
+        for position, idx in enumerate(eligible_indices):
+            eid = self._entry_ids[idx]
+            score = self._hybrid_score(
+                float(vector_scores[idx]), lexical_scores[position]
+            )
+            if score >= threshold and lexical_scores[position] >= self._bm25_min_score:
                 candidates.append((score, eid))
 
         if not candidates:
@@ -257,10 +307,11 @@ class KnowledgeBase:
         Deduplication is based on the embedding of ``topic + task_description``,
         where ``task_description`` is read from ``entry.metadata``.
         """
-        task_description = entry.metadata.get("task_description", "")
-        dedup_text = f"{entry.topic}\n{task_description}".strip() or entry.content[:500]
+        task_description = str(entry.metadata.get("task_description", "")).strip()
+        dedup_text = task_description or entry.topic or entry.content[:500]
         embedding = await asyncio.to_thread(self.embedder.encode_one, dedup_text)
         entry.embedding = embedding
+        entry.metadata["embedding_scope"] = self._EMBEDDING_SCOPE
 
         async with self._lock:
             insert_action = "inserted"
@@ -283,7 +334,9 @@ class KnowledgeBase:
                 insert_action = "replaced_id"
 
             # 2) Global semantic deduplication
-            dup_id = self._find_duplicate_id(embedding)
+            dup_id = self._find_duplicate_id(
+                embedding, task_description, entry.task_type
+            )
             if dup_id is not None and dup_id != entry.id:
                 existing = self._entries_cache[dup_id]
                 if existing.confidence >= entry.confidence:
@@ -318,7 +371,12 @@ class KnowledgeBase:
 
         return entry
 
-    def _find_duplicate_id(self, embedding: np.ndarray) -> str | None:
+    def _find_duplicate_id(
+        self,
+        embedding: np.ndarray,
+        task_description: str,
+        task_type: str,
+    ) -> str | None:
         """Find a duplicate in the global knowledge index."""
         if self._embeddings.shape[0] == 0:
             return None
@@ -329,11 +387,103 @@ class KnowledgeBase:
             return None
         query_emb = query_emb / norm
 
-        sims = self._embeddings.dot(query_emb)
-        best_idx = int(np.argmax(sims))
-        if float(sims[best_idx]) >= self._dedup_threshold:
-            return self._entry_ids[best_idx]
+        vector_scores = self._embeddings.dot(query_emb)
+        eligible_indices = [
+            idx
+            for idx, eid in enumerate(self._entry_ids)
+            if self._entries_cache[eid].task_type == task_type
+        ]
+        descriptions = [
+            self._entry_description(self._entries_cache[self._entry_ids[idx]])
+            for idx in eligible_indices
+        ]
+        lexical_scores = self._bm25_scores(task_description, descriptions)
+        candidates = [
+            (
+                self._hybrid_score(float(vector_scores[idx]), lexical_scores[position]),
+                self._entry_ids[idx],
+            )
+            for position, idx in enumerate(eligible_indices)
+        ]
+        if not candidates:
+            return None
+        score, entry_id = max(candidates, key=lambda item: item[0])
+        if score >= self._dedup_threshold:
+            return entry_id
         return None
+
+    @staticmethod
+    def _entry_description(entry: KnowledgeEntry) -> str:
+        return str(entry.metadata.get("task_description") or entry.topic or "")
+
+    @staticmethod
+    def _tokenize(text: str) -> list[str]:
+        """Tokenize Chinese prose while preserving model/version identifiers."""
+        normalized = text.lower().strip()
+        tokens = [
+            token.strip()
+            for token in jieba.lcut(normalized, cut_all=False)
+            if (
+                token.strip()
+                and token.strip() not in KnowledgeBase._BM25_STOPWORDS
+                and re.search(r"[\w\u4e00-\u9fff]", token)
+            )
+        ]
+        # jieba may split punctuation-bearing model names; retain them as
+        # additional exact-match tokens for lexical discrimination.
+        tokens.extend(re.findall(r"[a-z]+[a-z0-9.-]*\d[a-z0-9.-]*", normalized))
+        return tokens
+
+    @classmethod
+    def _bm25_scores(cls, query: str, documents: list[str]) -> list[float]:
+        """Return BM25 scores normalized by an ideal exact-match document."""
+        if not documents:
+            return []
+        query_tokens = cls._tokenize(query)
+        doc_tokens = [cls._tokenize(document) for document in documents]
+        if not query_tokens:
+            return [0.0] * len(documents)
+
+        doc_count = len(doc_tokens)
+        avg_len = sum(len(tokens) for tokens in doc_tokens) / max(doc_count, 1)
+        frequencies = [Counter(tokens) for tokens in doc_tokens]
+        document_frequency = Counter(
+            token for tokens in doc_tokens for token in set(tokens)
+        )
+        k1, b = 1.5, 0.75
+        query_terms = set(query_tokens)
+        max_score = sum(
+            math.log(
+                1.0
+                + (doc_count - document_frequency.get(token, 0) + 0.5)
+                / (document_frequency.get(token, 0) + 0.5)
+            )
+            for token in query_terms
+        )
+        scores: list[float] = []
+        for tokens, frequency in zip(doc_tokens, frequencies):
+            score = 0.0
+            for token in query_terms:
+                term_frequency = frequency.get(token, 0)
+                if not term_frequency:
+                    continue
+                df = document_frequency[token]
+                idf = math.log(1.0 + (doc_count - df + 0.5) / (df + 0.5))
+                length_norm = 1.0 - b + b * len(tokens) / max(avg_len, 1.0)
+                score += idf * (
+                    term_frequency * (k1 + 1.0)
+                    / (term_frequency + k1 * length_norm)
+                )
+            scores.append(score)
+        if max_score <= 0.0:
+            return [0.0] * len(scores)
+        return [min(1.0, score / max_score) for score in scores]
+
+    @staticmethod
+    def _hybrid_score(vector_score: float, lexical_score: float) -> float:
+        """Blend semantic similarity with exact lexical discrimination."""
+        vector_score = max(0.0, min(1.0, vector_score))
+        return 0.65 * vector_score + 0.35 * lexical_score
 
     # ------------------------------------------------------------------
     # Index helpers

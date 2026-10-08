@@ -170,6 +170,8 @@ memory:
   knowledge_db_path: "data/knowledge_base.db"
   # 去重相似度阈值：高于此值视为重复知识，不重复写入
   similarity_threshold_dup: 0.92
+  # 混合召回的 BM25 最低词项匹配分，避免仅凭公共语义误召回其他研究对象
+  bm25_min_score: 0.75
   # 子任务执行前召回记忆配置（仅 search 类型，工具调用多、省 token 最明显）
   recall_before_research:
     enabled: true

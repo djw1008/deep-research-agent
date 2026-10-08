@@ -1,6 +1,6 @@
 """Session Memory storage.
 
-Stores per-session research rounds (query + DAG + report) for follow-up
+Stores per-session research rounds (query + DAG + report + sources) for follow-up
 "continue research" interactions.
 """
 
@@ -26,6 +26,7 @@ CREATE TABLE IF NOT EXISTS session_rounds (
     query TEXT NOT NULL,
     dag TEXT NOT NULL,
     report TEXT NOT NULL,
+    sources TEXT NOT NULL DEFAULT '[]',
     created_at REAL NOT NULL
 );
 """
@@ -61,6 +62,15 @@ class SessionMemory:
         async with self._lock:
             conn = await self._connect()
             await conn.execute(_CREATE_TABLE_SQL)
+            cursor = await conn.execute("PRAGMA table_info(session_rounds)")
+            columns = {
+                row[1] for row in await cursor.fetchall()
+            }
+            if "sources" not in columns:
+                await conn.execute(
+                    "ALTER TABLE session_rounds "
+                    "ADD COLUMN sources TEXT NOT NULL DEFAULT '[]'"
+                )
             for stmt in _CREATE_INDEXES_SQL.strip().split(";"):
                 stmt = stmt.strip()
                 if stmt:
@@ -74,6 +84,7 @@ class SessionMemory:
         query: str,
         dag: dict[str, Any],
         report: str,
+        sources: list[dict] | None = None,
     ) -> SessionMemoryEntry:
         """Persist a single research round."""
         import time
@@ -86,6 +97,7 @@ class SessionMemory:
             dag=dag,
             report=report,
             created_at=time.time(),
+            sources=list(sources or []),
         )
 
         async with self._lock:
@@ -93,8 +105,8 @@ class SessionMemory:
             await conn.execute(
                 """
                 INSERT OR REPLACE INTO session_rounds
-                (id, session_id, round, query, dag, report, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                (id, session_id, round, query, dag, report, sources, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     entry.id,
@@ -103,6 +115,7 @@ class SessionMemory:
                     entry.query,
                     json.dumps(entry.dag, ensure_ascii=False),
                     entry.report,
+                    json.dumps(entry.sources, ensure_ascii=False),
                     entry.created_at,
                 ),
             )
@@ -165,6 +178,7 @@ class SessionMemory:
             dag=json.loads(row["dag"]),
             report=row["report"],
             created_at=row["created_at"],
+            sources=json.loads(row["sources"]) if row["sources"] else [],
         )
 
     async def close(self) -> None:

@@ -16,10 +16,11 @@ import logging
 import re
 from typing import Any
 
+from ..core.citations import SOURCE_LABEL_TOKEN, normalize_source_citations
 from ..core.schema import AgentResult, AgentStatus, ResearchReport, SubTask
 from ..core.report_content import (
+    compact_cited_sources,
     prepare_sources,
-    remove_invalid_citations,
     strip_reference_sections,
 )
 from .base_agent import BaseAgent
@@ -160,7 +161,9 @@ class SummarizerAgent(BaseAgent):
         sorted_results = sorted(results, key=lambda r: r.confidence, reverse=True)
 
         def _output_text(r: AgentResult) -> str:
-            return r.output if isinstance(r.output, str) else json.dumps(r.output, ensure_ascii=False, default=str)
+            if isinstance(r.output, str):
+                return r.output
+            return json.dumps(r.output, ensure_ascii=False, default=str)
 
         seen_outputs: dict[str, int] = {}
         unique_results: list[AgentResult] = []
@@ -177,19 +180,27 @@ class SummarizerAgent(BaseAgent):
             dup_counts[target] = dup_counts.get(target, 0) + 1
 
         sources = sources if sources is not None else self._collect_sources(results)
-        source_id_by_url = {source["url"]: source["citation_id"] for source in sources}
         parts = [
             f"# Research Question\n{query}\n",
             f"# 研究材料（共 {len(unique_results)} 份）\n",
         ]
         for i, r in enumerate(unique_results, 1):
             status_icon = "✓" if r.status == AgentStatus.SUCCESS else "✗"
-            dup_note = f"（另有 {dup_counts[i]} 份材料内容与此完全相同，视为同一来源的重复确认）\n" if dup_counts.get(i) else ""
+            dup_note = (
+                f"（另有 {dup_counts[i]} 份材料内容与此完全相同，"
+                "视为同一来源的重复确认）\n"
+                if dup_counts.get(i)
+                else ""
+            )
             material_ids = sorted({
-                source_id_by_url[url]
-                for url in self._source_urls(r)
-                if url in source_id_by_url
+                source["citation_id"]
+                for source in sources
+                for binding in source.get("bindings", [])
+                if binding.get("task_id") == r.task_id
             })
+            material_text = self._replace_research_citations(
+                _output_text(r), r.task_id, sources
+            )
             citation_note = (
                 "该材料关联的可用引用：" + ", ".join(f"[{sid}]" for sid in material_ids) + "\n"
                 if material_ids else "该材料没有已注册来源，不得为其中结论虚构引用。\n"
@@ -198,7 +209,7 @@ class SummarizerAgent(BaseAgent):
                 f"## 材料 {i} [{status_icon}] (confidence: {r.confidence:.2f})\n"
                 f"{dup_note}"
                 f"{citation_note}"
-                f"内容：\n{_output_text(r)}\n"
+                f"内容：\n{material_text}\n"
             )
 
         parts.append("\n# 可用引用注册表\n")
@@ -207,7 +218,6 @@ class SummarizerAgent(BaseAgent):
                 parts.append(
                     f"[{source['citation_id']}] {source.get('title', '')}\n"
                     f"URL: {source['url']}\n"
-                    f"摘要: {source.get('snippet', '')}\n"
                 )
         else:
             parts.append("无已注册来源。正文不得生成数字引用。\n")
@@ -225,57 +235,69 @@ class SummarizerAgent(BaseAgent):
         )
         return "\n".join(parts)
 
-    def _source_urls(self, result: AgentResult) -> list[str]:
-        """Extract source URLs associated with one research result."""
-        urls: list[str] = []
-        for step in result.trajectory:
-            if step.get("role") != "tool":
-                continue
-            res = step.get("result")
-            items: list[dict] = []
-            if isinstance(res, list):
-                items = [item for item in res if isinstance(item, dict)]
-            elif isinstance(res, dict):
-                if isinstance(res.get("results"), list):
-                    items = [item for item in res["results"] if isinstance(item, dict)]
-                elif isinstance(res.get("papers"), list):
-                    items = [item for item in res["papers"] if isinstance(item, dict)]
-            for item in items:
-                url = str(item.get("url") or item.get("pdf_url") or "").strip()
-                if url:
-                    urls.append(url)
-        return urls
+    @staticmethod
+    def _binding_label(binding: dict[str, Any]) -> str:
+        return str(binding.get("label", ""))
+
+    def _source_items(self, result: AgentResult) -> list[dict[str, Any]]:
+        """读取正常研究与记忆召回共用的已引用来源。"""
+        sources = result.metadata.get("sources", [])
+        if not isinstance(sources, list):
+            return []
+        return [source for source in sources if isinstance(source, dict)]
+
+    def _replace_research_citations(
+        self, text: str, task_id: str, sources: list[dict[str, Any]]
+    ) -> str:
+        mapping: dict[str, int] = {}
+        for source in sources:
+            for binding in source.get("bindings", []):
+                if binding.get("task_id") == task_id:
+                    mapping[self._binding_label(binding)] = int(source["citation_id"])
+        parsed = normalize_source_citations(text, set(mapping))
+        return re.sub(
+            rf"\[({SOURCE_LABEL_TOKEN})\]",
+            lambda match: (
+                f"[{mapping[match.group(1).upper()]}]"
+                if match.group(1).upper() in mapping else ""
+            ),
+            parsed.text,
+            flags=re.IGNORECASE,
+        )
 
     def _collect_sources(self, results: list[AgentResult]) -> list[dict[str, Any]]:
-        """Collect, filter, deduplicate and number sources before synthesis."""
-        collected: list[dict[str, Any]] = []
+        """Register only URLs explicitly cited in researcher outputs."""
+        collected_by_url: dict[str, dict[str, Any]] = {}
         for result in results:
             if result.status != AgentStatus.SUCCESS:
                 continue
-            for step in result.trajectory:
-                if step.get("role") != "tool":
+            output = result.output if isinstance(result.output, str) else ""
+            source_items = self._source_items(result)
+            available_labels = {
+                str(item.get("source_label", "")).upper()
+                for item in source_items
+                if item.get("source_label")
+            }
+            cited_labels = normalize_source_citations(
+                output, available_labels
+            ).cited_labels
+            for item in source_items:
+                label = str(item.get("source_label", "")).upper()
+                url = str(item.get("url") or item.get("pdf_url") or "").strip()
+                if label not in cited_labels or not url or self._is_noise_url(url):
                     continue
-                res = step.get("result")
-                items: list[dict] = []
-                if isinstance(res, list):
-                    items = [item for item in res if isinstance(item, dict)]
-                elif isinstance(res, dict) and isinstance(res.get("results"), list):
-                    items = [item for item in res["results"] if isinstance(item, dict)]
-                elif isinstance(res, dict) and isinstance(res.get("papers"), list):
-                    items = [item for item in res["papers"] if isinstance(item, dict)]
-                for item in items:
-                    url = str(item.get("url") or item.get("pdf_url") or "").strip()
-                    if not url or self._is_noise_url(url):
-                        continue
-                    collected.append({
+                binding = {"task_id": result.task_id, "label": label}
+                if url in collected_by_url:
+                    if binding not in collected_by_url[url]["bindings"]:
+                        collected_by_url[url]["bindings"].append(binding)
+                    continue
+                collected_by_url[url] = {
                         "url": url,
                         "title": item.get("title", ""),
-                        "snippet": str(
-                            item.get("snippet") or item.get("summary") or ""
-                        )[:500],
                         "task_id": result.task_id,
-                    })
-        return prepare_sources(collected)
+                        "bindings": [binding],
+                    }
+        return prepare_sources(list(collected_by_url.values()))
 
     _NOISE_DOMAINS = {
         # 社交媒体
@@ -350,8 +372,17 @@ class SummarizerAgent(BaseAgent):
             flags=re.IGNORECASE,
         ).rstrip()
         content = strip_reference_sections(content)
-        sources = prepare_sources(sources if sources is not None else self._collect_sources(results))
-        content = remove_invalid_citations(content, sources)
+        sources = prepare_sources(
+            sources if sources is not None else self._collect_sources(results)
+        )
+        content, selected = compact_cited_sources(content, sources)
+        sources = prepare_sources([
+            {
+                key: value for key, value in source.items()
+                if key not in {"bindings", "task_id", "citation_id"}
+            }
+            for source in selected
+        ])
 
         # 统计实际工具调用次数
         num_searches = sum(

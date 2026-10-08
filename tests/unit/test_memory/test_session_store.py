@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import sqlite3
+
 import pytest
 
 from deep_research.memory.session_store import SessionMemory
@@ -23,6 +25,11 @@ async def test_add_and_get_history(session_memory):
         query="GPT-4o capabilities",
         dag={"nodes": ["task_1"], "edges": {}},
         report="GPT-4o supports 128K context.",
+        sources=[{
+            "citation_id": 1,
+            "title": "GPT-4o",
+            "url": "https://example.com/gpt-4o",
+        }],
     )
 
     assert entry.session_id == "s1"
@@ -32,6 +39,38 @@ async def test_add_and_get_history(session_memory):
     history = await session_memory.get_session_history("s1")
     assert len(history) == 1
     assert history[0].report == "GPT-4o supports 128K context."
+    assert history[0].sources == entry.sources
+
+
+@pytest.mark.asyncio
+async def test_initialize_migrates_legacy_database_with_sources_column(tmp_path):
+    db_path = tmp_path / "legacy_session_memory.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE session_rounds (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                round INTEGER NOT NULL,
+                query TEXT NOT NULL,
+                dag TEXT NOT NULL,
+                report TEXT NOT NULL,
+                created_at REAL NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            "INSERT INTO session_rounds VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("s1:round:1", "s1", 1, "q", "{}", "legacy report", 1.0),
+        )
+
+    memory = SessionMemory(str(db_path))
+    await memory.initialize()
+    try:
+        history = await memory.get_session_history("s1")
+        assert history[0].sources == []
+    finally:
+        await memory.close()
 
 
 @pytest.mark.asyncio

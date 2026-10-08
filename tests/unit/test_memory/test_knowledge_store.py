@@ -34,7 +34,7 @@ async def test_add_and_search(knowledge_base):
     assert stored.id == entry.id
     assert stored.metadata.get("action") == "inserted"
 
-    matches = await knowledge_base.search("GPT-4o release", task_type="search", threshold=0.0)
+    matches = await knowledge_base.search("release date", task_type="search", threshold=0.0)
     assert len(matches) == 1
     assert "May 2024" in matches[0].entry.content
 
@@ -65,7 +65,7 @@ async def test_global_deduplication_keeps_higher_confidence(knowledge_base):
 
     assert stored.confidence == 0.9
 
-    matches = await knowledge_base.search("Topic description", task_type="search", threshold=0.0)
+    matches = await knowledge_base.search("description", task_type="search", threshold=0.0)
     assert len(matches) == 1
     assert matches[0].entry.confidence == 0.9
 
@@ -91,6 +91,55 @@ async def test_search_filters_by_task_type(knowledge_base):
         metadata={"task_description": "analyze task"},
     ))
 
-    matches = await knowledge_base.search("t", task_type="search", threshold=0.0)
+    matches = await knowledge_base.search("search task", task_type="search", threshold=0.0)
     assert len(matches) == 1
     assert matches[0].entry.task_type == "search"
+
+
+@pytest.mark.asyncio
+async def test_hybrid_search_prefers_matching_model_entity(knowledge_base):
+    await knowledge_base.initialize()
+    common = "在中文推理、代码生成和长上下文任务上的性能表现数据"
+    for model in ("GPT-4o", "Claude 3.5", "Gemini 1.5", "Qwen2.5"):
+        description = f"收集 {model} {common}"
+        await knowledge_base.add(KnowledgeEntry(
+            id=KnowledgeBase.make_id("comparison", description),
+            content=f"result for {model}",
+            task_type="search",
+            topic="comparison",
+            confidence=0.8,
+            metadata={"task_description": description},
+        ))
+
+    matches = await knowledge_base.search(
+        f"整理 Gemini 1.5 {common}",
+        task_type="search",
+        top_k=1,
+        threshold=0.0,
+    )
+
+    assert len(matches) == 1
+    assert matches[0].entry.content == "result for Gemini 1.5"
+
+
+@pytest.mark.asyncio
+async def test_hybrid_search_rejects_different_model_with_shared_template(knowledge_base):
+    await knowledge_base.initialize()
+    qwen_description = "收集 Qwen2.5 在中文推理、代码生成和长上下文任务上的性能表现数据"
+    await knowledge_base.add(KnowledgeEntry(
+        id=KnowledgeBase.make_id("comparison", qwen_description),
+        content="Qwen result",
+        task_type="search",
+        topic="comparison",
+        confidence=0.8,
+        metadata={"task_description": qwen_description},
+    ))
+
+    matches = await knowledge_base.search(
+        "收集 Gemini 1.5 在中文推理、代码生成和长上下文任务上的性能表现数据",
+        task_type="search",
+        top_k=1,
+        threshold=0.0,
+    )
+
+    assert matches == []

@@ -32,6 +32,46 @@ def context():
     return ResearchContext(topic="AI safety")
 
 
+@pytest.mark.asyncio
+async def test_knowledge_persistence_uses_cited_sources_from_metadata():
+    class CaptureKnowledgeBase:
+        def __init__(self):
+            self.entry = None
+
+        async def add(self, entry):
+            self.entry = entry
+            return entry
+
+    knowledge_base = CaptureKnowledgeBase()
+    orchestrator = Orchestrator(knowledge_base=knowledge_base)
+    orchestrator._query = "topic"
+    orchestrator._task_map = {
+        "research_1": SubTask(
+            id="research_1",
+            description="research task",
+            task_type="search",
+        )
+    }
+    cited_sources = [{
+        "source_label": "SRC-1",
+        "url": "https://example.com/used",
+        "title": "Used source",
+        "snippet": "evidence",
+    }]
+    result = AgentResult(
+        task_id="research_1",
+        status=AgentStatus.SUCCESS,
+        output="Finding [SRC-1].",
+        confidence=0.9,
+        metadata={"from_memory": False, "sources": cited_sources},
+    )
+
+    await orchestrator._persist_to_knowledge_base(result)
+
+    assert knowledge_base.entry.sources == cited_sources
+    assert "sources" not in knowledge_base.entry.metadata
+
+
 # ---------------------------------------------------------------------------
 # Guards
 # ---------------------------------------------------------------------------

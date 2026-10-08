@@ -31,9 +31,9 @@ from ..core.schema import (
 )
 from ..core.report_content import (
     citation_ids,
+    compact_cited_sources,
     prepare_sources,
     remap_citation_ids,
-    remove_invalid_citations,
     strip_reference_sections,
 )
 from .base_agent import BaseAgent
@@ -54,7 +54,7 @@ SYSTEM_BLUE_AGENT = (
     "你是一位严谨的研究报告编辑（Blue Agent）。你的任务是根据 Red Agent 指出的问题，"
     "对研究报告进行最小化、安全的修改。核心原则：\n"
     "1. 绝不能为了修复问题而编造来源或事实。\n"
-    "2. 如果信息无法验证，应删除该论断或添加 [未经证实]/[来源待补充] 标注。\n"
+    "2. 如果已有来源能够支持论断，即使权威性较低，也应保留引用并注明来源性质；只有来源缺失或不支持论断时，才删除或弱化该论断。不得输出 [来源待补充] 等占位标记。\n"
     "3. 每次只修改 issue 明确指向的位置，不要扩大范围。\n"
     "4. 输出必须是严格的 JSON 格式，包含完整的修改后报告。\n"
     "5. 来源清单由程序维护。不得创建或修改引用来源/参考文献/参考链接章节。"
@@ -90,7 +90,8 @@ PROMPT_SEARCH = """请根据以下 issue 修改研究报告。
 修改要求：
 - issue 指出某 claim 需要来源支撑。
 - 优先在"可用 Sources"和"新增搜索结果"中查找能支撑该 claim 的来源；若找到，补充引用并改写表述。
-- 若均无支撑来源，请删除该具体 claim 或改写为不确定性表述，并添加 [来源待补充] 标注。
+- 如果现有来源能够支持该 claim，只是权威性较低，应保留引用并注明来源性质，或用更权威来源替换；不得将其当作无来源内容。
+- 若均无支撑来源，请删除该具体 claim，或删去无法支撑的精确数据并改写为不确定性表述；不得添加 [来源待补充] 等占位标记。
 - 不要编造 URL、数据或研究结论。
 
 输出必须是 JSON：
@@ -290,7 +291,7 @@ class BlueTeamAgent(BaseAgent):
                     current_report.sources,
                     fix_result.get("sources", []),
                 )
-                current_report.content = remove_invalid_citations(
+                current_report.content, current_report.sources = compact_cited_sources(
                     strip_reference_sections(fix_result["content"]),
                     current_report.sources,
                 )
@@ -528,7 +529,7 @@ class BlueTeamAgent(BaseAgent):
             if web_search_tool is not None:
                 search_results_text = (
                     "（你可以调用 web_search 工具获取补充来源，最多 2 次；"
-                    "如果搜索无果，请删除或标注 [来源待补充]。）"
+                    "如果搜索无果，请删除无支撑论断或弱化表述，不得添加引用占位标记。）"
                 )
             else:
                 search_results_text = "（未配置 web_search 工具，无法补充来源。）"

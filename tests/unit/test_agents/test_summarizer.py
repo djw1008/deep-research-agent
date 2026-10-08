@@ -27,8 +27,8 @@ Artificial intelligence safety is a critical field.
 AI systems are becoming more powerful.
 
 ## Key Findings
-1. Alignment problem remains unsolved.
-2. Interpretability is improving.
+1. Alignment problem remains unsolved [1].
+2. Interpretability is improving [2].
 
 ## Analysis
 Detailed analysis goes here with enough length to satisfy the requirement.
@@ -68,20 +68,28 @@ async def test_synthesize_success():
         AgentResult(
             task_id="t1",
             status=AgentStatus.SUCCESS,
-            output="Found that AI alignment is hard.",
+            output="Found that AI alignment is hard [SRC-1].",
             confidence=0.9,
-            trajectory=[
-                {"role": "tool", "result": {"results": [{"url": "https://example.com/1", "title": "AI Alignment", "snippet": "Alignment is hard"}]}},
-            ],
+            trajectory=[{"role": "tool", "result": {}}],
+            metadata={"sources": [{
+                "url": "https://example.com/1",
+                "title": "AI Alignment",
+                "snippet": "Alignment is hard",
+                "source_label": "SRC-1",
+            }]},
         ),
         AgentResult(
             task_id="t2",
             status=AgentStatus.SUCCESS,
-            output="Interpretability is improving.",
+            output="Interpretability is improving [SRC-1].",
             confidence=0.8,
-            trajectory=[
-                {"role": "tool", "result": {"papers": [{"pdf_url": "https://arxiv.org/abs/1234", "title": "Interp Paper", "summary": "We show improvements"}]}},
-            ],
+            trajectory=[{"role": "tool", "result": {}}],
+            metadata={"sources": [{
+                "url": "https://arxiv.org/abs/1234",
+                "title": "Interp Paper",
+                "snippet": "We show improvements",
+                "source_label": "SRC-1",
+            }]},
         ),
     ]
 
@@ -148,16 +156,16 @@ Overall Confidence: 0.80
     source_result = AgentResult(
         task_id="t1",
         status=AgentStatus.SUCCESS,
-        output="材料",
+        output="材料 [SRC-1]",
         confidence=1.0,
-        trajectory=[{
-            "role": "tool",
-            "result": [{
+        metadata={"sources": [
+            {
                 "title": "Source",
                 "url": "https://example.com/source",
                 "snippet": "evidence",
-            }],
-        }],
+                "source_label": "SRC-1",
+            }
+        ]},
     )
 
     result = await agent.run(task, {"query": "test", "results": [source_result]})
@@ -172,16 +180,16 @@ def test_synthesis_prompt_binds_material_to_registered_source_number():
     source_result = AgentResult(
         task_id="t1",
         status=AgentStatus.SUCCESS,
-        output="该来源支持结论。",
+        output="该来源支持结论 [SRC-1]。",
         confidence=0.9,
-        trajectory=[{
-            "role": "tool",
-            "result": [{
+        metadata={"sources": [
+            {
                 "title": "Primary Source",
                 "url": "https://example.com/primary",
                 "snippet": "supporting evidence",
-            }],
-        }],
+                "source_label": "SRC-1",
+            }
+        ]},
     )
     sources = agent._collect_sources([source_result])
 
@@ -190,6 +198,134 @@ def test_synthesis_prompt_binds_material_to_registered_source_number():
     assert "该材料关联的可用引用：[1]" in prompt
     assert "[1] Primary Source" in prompt
     assert "不得创造编号" in prompt
+    assert "摘要: supporting evidence" not in prompt
+
+
+def test_uncited_researcher_url_is_not_registered():
+    agent = SummarizerAgent(name="sum", policy=FakeLLMClient(""))
+    source_result = AgentResult(
+        task_id="t1",
+        status=AgentStatus.SUCCESS,
+        output="Only the first source is used [SRC-1].",
+        confidence=0.9,
+        metadata={"sources": [
+            {"title": "Used", "url": "https://example.com/used", "source_label": "SRC-1"},
+            {"title": "Unused", "url": "https://example.com/unused", "source_label": "SRC-2"},
+        ]},
+    )
+
+    sources = agent._collect_sources([source_result])
+
+    assert [source["url"] for source in sources] == ["https://example.com/used"]
+
+
+def test_legacy_malformed_citation_is_registered_and_replaced():
+    agent = SummarizerAgent(name="sum", policy=FakeLLMClient(""))
+    source_result = AgentResult(
+        task_id="t1",
+        status=AgentStatus.SUCCESS,
+        output="Legacy recalled result [SRC-13 摘要].",
+        metadata={"sources": [{
+            "title": "Legacy source",
+            "url": "https://example.com/legacy",
+            "source_label": "SRC-13",
+        }]},
+    )
+
+    sources = agent._collect_sources([source_result])
+
+    assert [source["url"] for source in sources] == ["https://example.com/legacy"]
+    assert agent._replace_research_citations(
+        source_result.output, "t1", sources
+    ) == "Legacy recalled result [1]."
+
+
+def test_namespaced_dependency_citation_is_registered_and_replaced():
+    agent = SummarizerAgent(name="sum", policy=FakeLLMClient(""))
+    source_result = AgentResult(
+        task_id="t2",
+        status=AgentStatus.SUCCESS,
+        output="Inherited evidence [T1:SRC-3].",
+        metadata={"sources": [{
+            "title": "Upstream source",
+            "url": "https://example.com/upstream",
+            "source_label": "T1:SRC-3",
+        }]},
+    )
+
+    sources = agent._collect_sources([source_result])
+
+    assert sources[0]["bindings"] == [{"task_id": "t2", "label": "T1:SRC-3"}]
+    assert agent._replace_research_citations(
+        source_result.output, "t2", sources
+    ) == "Inherited evidence [1]."
+
+
+def test_same_url_from_multiple_researchers_gets_one_global_citation():
+    agent = SummarizerAgent(name="sum", policy=FakeLLMClient(""))
+    results = [
+        AgentResult(
+            task_id="t1",
+            status=AgentStatus.SUCCESS,
+            output="First finding [SRC-1].",
+            metadata={"sources": [{
+                "source_label": "SRC-1",
+                "url": "https://example.com/shared",
+                "title": "Shared source",
+            }]},
+        ),
+        AgentResult(
+            task_id="t2",
+            status=AgentStatus.SUCCESS,
+            output="Second finding [SRC-3].",
+            metadata={"sources": [{
+                "source_label": "SRC-3",
+                "url": "https://example.com/shared",
+                "title": "Shared source",
+            }]},
+        ),
+    ]
+
+    sources = agent._collect_sources(results)
+
+    assert len(sources) == 1
+    assert sources[0]["citation_id"] == 1
+    assert sources[0]["bindings"] == [
+        {"task_id": "t1", "label": "SRC-1"},
+        {"task_id": "t2", "label": "SRC-3"},
+    ]
+    assert agent._replace_research_citations(results[0].output, "t1", sources) == (
+        "First finding [1]."
+    )
+    assert agent._replace_research_citations(results[1].output, "t2", sources) == (
+        "Second finding [1]."
+    )
+
+
+@pytest.mark.asyncio
+async def test_final_report_keeps_only_summarizer_citations_and_compacts_numbers():
+    content = "Conclusion uses the second registered source [2].\n\nOverall Confidence: 0.80"
+    agent = SummarizerAgent(name="sum", policy=FakeLLMClient(content))
+    result = AgentResult(
+        task_id="t1",
+        status=AgentStatus.SUCCESS,
+        output="First [SRC-1], second [SRC-2].",
+        confidence=0.9,
+        metadata={"sources": [
+            {"title": "First", "url": "https://example.com/first", "source_label": "SRC-1"},
+            {"title": "Second", "url": "https://example.com/second", "source_label": "SRC-2"},
+        ]},
+    )
+
+    synthesized = await agent.run(
+        SubTask(id="synthesize", description="report", task_type="synthesize"),
+        {"query": "test", "results": [result]},
+    )
+
+    assert synthesized.output.content == "Conclusion uses the second registered source [1]."
+    assert [source["url"] for source in synthesized.output.sources] == [
+        "https://example.com/second"
+    ]
 
 
 @pytest.mark.asyncio

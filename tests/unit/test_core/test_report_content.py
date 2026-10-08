@@ -1,5 +1,6 @@
 from deep_research.core.report_content import (
     citation_ids,
+    compact_cited_sources,
     invalid_citation_ids,
     prepare_sources,
     remap_citation_ids,
@@ -41,3 +42,21 @@ def test_citation_ids_can_be_extracted_and_remapped():
 
     assert citation_ids(content) == {1, 4}
     assert remap_citation_ids(content, {4: 2}) == "已有 [1]，候选 [2]，重复候选 [2]。"
+
+
+def test_compact_cited_sources_removes_unused_and_renumbers_by_appearance():
+    sources = prepare_sources([
+        {"title": "A", "url": "https://example.com/a"},
+        {"title": "B", "url": "https://example.com/b"},
+        {"title": "C", "url": "https://example.com/c"},
+    ])
+
+    content, compacted = compact_cited_sources(
+        "先引用 C [3]，再引用 A [1]，无效引用 [9]。", sources
+    )
+
+    assert content == "先引用 C [1]，再引用 A [2]，无效引用 。"
+    assert [(source["citation_id"], source["title"]) for source in compacted] == [
+        (1, "C"),
+        (2, "A"),
+    ]

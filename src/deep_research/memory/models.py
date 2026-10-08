@@ -14,6 +14,7 @@ class SessionMemoryEntry:
     - what the user asked
     - how the system planned to answer (DAG)
     - what the final report was
+    - which sources the final report cited
 
     Multiple entries with the same ``session_id`` form a conversation-like
     research history that can be used for "continue research" follow-ups.
@@ -26,6 +27,7 @@ class SessionMemoryEntry:
     dag: dict[str, Any]
     report: str
     created_at: float
+    sources: list[dict] = field(default_factory=list)
 
 
 @dataclass

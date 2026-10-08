@@ -75,3 +75,19 @@ def remove_invalid_citations(content: str, sources: list[dict[str, Any]]) -> str
         lambda match: "" if int(match.group(1)) in invalid else match.group(0),
         content,
     )
+
+
+def compact_cited_sources(
+    content: str, sources: list[dict[str, Any]]
+) -> tuple[str, list[dict[str, Any]]]:
+    """Keep cited sources only and renumber citations by first appearance."""
+    prepared = prepare_sources(sources)
+    content = remove_invalid_citations(content, prepared)
+    used_ids = list(dict.fromkeys(int(match) for match in _CITATION.findall(content or "")))
+    source_by_id = {int(source["citation_id"]): source for source in prepared}
+    selected = [source_by_id[source_id] for source_id in used_ids if source_id in source_by_id]
+    mapping = {
+        int(source["citation_id"]): index
+        for index, source in enumerate(selected, 1)
+    }
+    return remap_citation_ids(content, mapping), prepare_sources(selected)

@@ -242,6 +242,50 @@ async def test_run_with_issues_uses_one_repair_call():
 
 
 @pytest.mark.asyncio
+async def test_run_compacts_sources_after_removing_a_cited_claim():
+    response = json.dumps(
+        {"content": "保留第二个结论 [2]。", "changes": "删除第一个结论"},
+        ensure_ascii=False,
+    )
+    agent = BlueTeamAgent(
+        name="blue_agent",
+        policy=FakePolicy(responses=[response]),
+    )
+    report = ResearchReport(
+        query="AI safety",
+        content="第一个结论 [1]。第二个结论 [2]。",
+        sources=[
+            {"title": "First", "url": "https://example.com/first"},
+            {"title": "Second", "url": "https://example.com/second"},
+        ],
+    )
+    issue = Issue(
+        dimension=AttackDimension.HALLUCINATION,
+        severity=Severity.CRITICAL,
+        location="第一句",
+        description="删除第一个结论",
+        fix_type=FixType.REMOVAL,
+    )
+
+    result = await agent.run(
+        SubTask(id="blue_1", description="blue repair", task_type="blue_agent"),
+        {
+            "report": report,
+            "query": "AI safety",
+            "dimension": AttackDimension.HALLUCINATION,
+            "issues": [issue],
+        },
+    )
+
+    assert result.output.content == "保留第二个结论 [1]。"
+    assert result.output.sources == [{
+        "title": "Second",
+        "url": "https://example.com/second",
+        "citation_id": 1,
+    }]
+
+
+@pytest.mark.asyncio
 async def test_run_invalid_report():
     agent = BlueTeamAgent(name="blue_agent", policy=FakePolicy())
     task = SubTask(id="blue_1", description="blue repair", task_type="blue_agent")

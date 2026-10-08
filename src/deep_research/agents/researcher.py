@@ -10,6 +10,7 @@ from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from ..compressor.context_compressor import ContextCompressor
+from ..core.citations import normalize_source_citations
 from ..core.schema import AgentResult, AgentStatus, SubTask
 from ..observability import EventSink, ObservableTrajectory
 from .base_agent import BaseAgent
@@ -85,6 +86,7 @@ class ResearchAgent(BaseAgent):
         consecutive_tool_failures: int = 0  # 工具内部重试耗尽后，按调用计数
         force_summary_after_failures: bool = False
         seen_search_urls: set[str] = set()
+        source_labels: dict[str, str] = {}
 
         # 启发式判断：无法通过网络搜索获取答案的任务
         if self._is_non_searchable(task, context):
@@ -236,25 +238,25 @@ class ResearchAgent(BaseAgent):
                         logging.warning(
                             "[%s] 最后一轮仍含XML伪工具调用，清洗后返回", task.id
                         )
+                        cleaned, metadata = self._prepare_result(
+                            task, cleaned, trajectory, context, from_memory=False
+                        )
                         return AgentResult(
                             task_id=task.id, status=AgentStatus.SUCCESS,
                             output=cleaned, trajectory=trajectory,
                             token_usage=total_tokens,
                             confidence=self._extract_confidence(cleaned),
-                            metadata={
-                                "from_memory": False,
-                                "task_description": task.description,
-                            },
+                            metadata=metadata,
                         )
 
+                content, metadata = self._prepare_result(
+                    task, content, trajectory, context, from_memory=False
+                )
                 return AgentResult(
                     task_id=task.id, status=AgentStatus.SUCCESS, output=content,
                     trajectory=trajectory, token_usage=total_tokens,
                     confidence=self._extract_confidence(content),
-                    metadata={
-                        "from_memory": False,
-                        "task_description": task.description,
-                    },
+                    metadata=metadata,
                 )
 
             # 执行工具
@@ -479,6 +481,9 @@ class ResearchAgent(BaseAgent):
                 else:
                     consecutive_tool_failures = 0
 
+                # 为模型实际看到的 URL 分配稳定局部标签，供最终总结引用。
+                self._attach_source_labels(result, source_labels)
+
                 tool_results.append({"tool_call_id": tc.get("id", ""), "name": tool_name, "result": result})
                 tool_event = {"turn": turn, "role": "tool", "tool_call_id": tc.get("id", ""), "name": tool_name, "result": result}
                 tool_event["failed"] = tool_failed
@@ -588,10 +593,14 @@ class ResearchAgent(BaseAgent):
 
         content = resp.content or ""
         trajectory.append({"role": "assistant", "content": content})
+        content, metadata = self._prepare_result(
+            task, content, trajectory, context, from_memory=False
+        )
         return AgentResult(
             task_id=task.id, status=AgentStatus.SUCCESS, output=content,
             trajectory=trajectory, token_usage=len(content) // 3,
             confidence=self._extract_confidence(content),
+            metadata=metadata,
         )
 
     def _is_time_sensitive_query(self, context: dict) -> bool:
@@ -613,8 +622,9 @@ class ResearchAgent(BaseAgent):
         threshold = cfg.get("threshold", 0.75)
         top_k = cfg.get("top_k", 1)
 
-        # 把原始研究问题与子任务描述拼接，和知识库条目 embedding 的 topic+task_description 对齐。
-        search_query = f"{query}\n{task.description}".strip()
+        # 只比较当前子任务。原始问题在同一批子任务中高度重复，会淹没
+        # GPT/Claude/Gemini/Qwen 等真正用于区分研究对象的关键词。
+        search_query = task.description.strip()
 
         try:
             matches = await self.knowledge_base.search(
@@ -655,6 +665,7 @@ class ResearchAgent(BaseAgent):
                 "memory_id": best.entry.id,
                 "memory_score": round(best.score, 4),
                 "task_description": task.description,
+                "sources": list(best.entry.sources or []),
             },
         )
 
@@ -686,8 +697,215 @@ class ResearchAgent(BaseAgent):
             "10. 禁止问候用户，直接执行。\n"
             "11. 当系统提示'最后阶段'时，必须立即输出最终总结，绝对禁止调用工具。\n"
             "12. 工具调用失败时，如实报告失败原因，禁止编造数据或基于训练数据回答。\n"
-            "13. 【反范围蔓延】如果你在搜索中发现了与任务描述无关但'更有趣'的信息，必须忽略它，不得偏离当前任务。"
+            "13. 【反范围蔓延】如果你在搜索中发现了与任务描述无关但'更有趣'的信息，必须忽略它，不得偏离当前任务。\n"
+            "14. 工具结果中的 URL 会带有 source_label（如 SRC-1）。最终总结中的事实和数据必须在相关句末引用对应标签，格式为 [SRC-1]；"
+            "只能引用实际出现过的标签，不得自行编造标签，也不要输出参考文献列表。"
         )
+
+    @staticmethod
+    def _source_items(result: Any) -> list[dict[str, Any]]:
+        """提取工具结果中所有带 URL 的来源项。"""
+        items: list[dict[str, Any]] = []
+        if isinstance(result, list):
+            items = [item for item in result if isinstance(item, dict)]
+        elif isinstance(result, dict):
+            if result.get("url") or result.get("pdf_url"):
+                items.append(result)
+            for key in ("results", "papers"):
+                nested = result.get(key)
+                if isinstance(nested, list):
+                    items.extend(item for item in nested if isinstance(item, dict))
+        return items
+
+    @classmethod
+    def _attach_source_labels(
+        cls, result: Any, labels_by_url: dict[str, str]
+    ) -> None:
+        """为单个 ResearchAgent 看到的 URL 分配稳定局部标签。"""
+        for item in cls._source_items(result):
+            url = str(item.get("url") or item.get("pdf_url") or "").strip()
+            if not url:
+                continue
+            label = labels_by_url.get(url)
+            if label is None:
+                label = f"SRC-{len(labels_by_url) + 1}"
+                labels_by_url[url] = label
+            item["source_label"] = label
+
+    @classmethod
+    def _build_result_metadata(
+        cls,
+        task: SubTask,
+        output: str,
+        trajectory: list[dict[str, Any]],
+        *,
+        from_memory: bool,
+    ) -> dict[str, Any]:
+        """构造持久化和报告合成共用的来源元数据。"""
+        return {
+            "from_memory": from_memory,
+            "task_description": task.description,
+            "sources": cls._select_cited_sources(output, trajectory),
+        }
+
+    @classmethod
+    def _prepare_result(
+        cls,
+        task: SubTask,
+        output: str,
+        trajectory: list[dict[str, Any]],
+        context: dict[str, Any] | None = None,
+        *,
+        from_memory: bool,
+    ) -> tuple[str, dict[str, Any]]:
+        """Normalize citations before output and source metadata are persisted."""
+        available_sources = cls._available_sources(trajectory, context)
+        available_labels = set(available_sources)
+        parsed = normalize_source_citations(output, available_labels)
+        if parsed.invalid_labels:
+            logging.warning(
+                "[%s] 输出包含不存在的来源标签: %s",
+                task.id,
+                sorted(parsed.invalid_labels),
+            )
+        selected_sources = cls._select_sources_by_labels(
+            parsed.cited_labels, available_sources
+        )
+        metadata = {
+            "from_memory": from_memory,
+            "task_description": task.description,
+            "sources": selected_sources,
+        }
+        metadata["citation_diagnostics"] = {
+            "normalized_count": parsed.normalized_count,
+            "invalid_labels": sorted(parsed.invalid_labels),
+        }
+        return parsed.text, metadata
+
+    @classmethod
+    def _available_sources(
+        cls,
+        trajectory: list[dict[str, Any]],
+        context: dict[str, Any] | None = None,
+    ) -> dict[str, dict[str, str]]:
+        """Index local and dependency sources by their unambiguous labels."""
+        indexed: dict[str, dict[str, str]] = {}
+        for step in trajectory:
+            if step.get("role") != "tool":
+                continue
+            for item in cls._source_items(step.get("result")):
+                label = str(item.get("source_label", "")).upper()
+                url = str(item.get("url") or item.get("pdf_url") or "").strip()
+                if label and url:
+                    indexed[label] = cls._merge_source_metadata(indexed.get(label), item)
+
+        for key, sources in (context or {}).items():
+            if not key.startswith("dep_sources:") or not isinstance(sources, list):
+                continue
+            dep_id = key.removeprefix("dep_sources:")
+            for item in sources:
+                if not isinstance(item, dict):
+                    continue
+                local_label = str(item.get("source_label", "")).upper()
+                url = str(item.get("url") or item.get("pdf_url") or "").strip()
+                if local_label and url:
+                    indexed[cls._dependency_label(dep_id, local_label)] = item
+        return indexed
+
+    @staticmethod
+    def _merge_source_metadata(
+        existing: dict[str, Any] | None,
+        incoming: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Merge repeated tool results without replacing useful text with empty/mojibake fields."""
+        if existing is None:
+            return dict(incoming)
+
+        merged = dict(existing)
+        for key, value in incoming.items():
+            if key in {"title", "snippet", "summary"}:
+                text = str(value or "").strip()
+                if text and "�" not in text and not any("\x80" <= char <= "\x9f" for char in text):
+                    merged[key] = value
+            elif value not in (None, ""):
+                merged[key] = value
+        return merged
+
+    @staticmethod
+    def _dependency_label(dep_id: str, label: str) -> str:
+        """Keep original provenance when a source crosses multiple DAG layers."""
+        normalized = label.upper()
+        if ":" in normalized:
+            return normalized
+        return f"{dep_id}:{normalized}".upper()
+
+    @staticmethod
+    def _select_sources_by_labels(
+        cited_labels: set[str],
+        available_sources: dict[str, dict[str, Any]],
+    ) -> list[dict[str, str]]:
+        selected: list[dict[str, str]] = []
+        seen_bindings: set[tuple[str, str]] = set()
+        for label, item in available_sources.items():
+            url = str(item.get("url") or item.get("pdf_url") or "").strip()
+            binding = (label, url)
+            if label not in cited_labels or not url or binding in seen_bindings:
+                continue
+            seen_bindings.add(binding)
+            selected.append({
+                "source_label": label,
+                "url": url,
+                "title": str(item.get("title", "")),
+                "snippet": str(item.get("snippet") or item.get("summary") or "")[:500],
+            })
+        return selected
+
+    @classmethod
+    def _available_source_labels(
+        cls, trajectory: list[dict[str, Any]]
+    ) -> set[str]:
+        labels: set[str] = set()
+        for step in trajectory:
+            if step.get("role") != "tool":
+                continue
+            for item in cls._source_items(step.get("result")):
+                label = str(item.get("source_label", "")).upper()
+                if label:
+                    labels.add(label)
+        return labels
+
+    @classmethod
+    def _select_cited_sources(
+        cls, output: str, trajectory: list[dict[str, Any]]
+    ) -> list[dict[str, str]]:
+        """只保留最终 output 明确引用的 URL 来源。"""
+        parsed = normalize_source_citations(
+            output, cls._available_source_labels(trajectory)
+        )
+        cited_labels = parsed.cited_labels
+        if not cited_labels:
+            return []
+
+        selected: list[dict[str, str]] = []
+        seen_urls: set[str] = set()
+        for step in trajectory:
+            if step.get("role") != "tool":
+                continue
+            for item in cls._source_items(step.get("result")):
+                label = str(item.get("source_label", "")).upper()
+                url = str(item.get("url") or item.get("pdf_url") or "").strip()
+                if label not in cited_labels or not url or url in seen_urls:
+                    continue
+                seen_urls.add(url)
+                selected.append({
+                    "source_label": label,
+                    "url": url,
+                    "title": str(item.get("title", "")),
+                    "snippet": str(
+                        item.get("snippet") or item.get("summary") or ""
+                    )[:500],
+                })
+        return selected
 
     def _system_prompt_direct_analysis(self) -> str:
         return (
@@ -777,7 +995,44 @@ class ResearchAgent(BaseAgent):
                 dep_key = f"dep:{dep_id}"
                 dep_output = context.get(dep_key)
                 if dep_output is not None:
-                    dep_parts.append(f"### 上游任务 {dep_id} 的结果:\n{dep_output}")
+                    dep_sources = context.get(f"dep_sources:{dep_id}", [])
+                    local_labels = {
+                        str(source.get("source_label", "")).upper()
+                        for source in dep_sources
+                        if isinstance(source, dict) and source.get("source_label")
+                    }
+                    parsed = normalize_source_citations(str(dep_output), local_labels)
+                    namespaced_output = re.sub(
+                        r"\[(SRC-\d+)\]",
+                        lambda match: (
+                            f"[{self._dependency_label(dep_id, match.group(1))}]"
+                        ),
+                        parsed.text,
+                        flags=re.IGNORECASE,
+                    )
+                    registry = []
+                    registry_labels = []
+                    for source in dep_sources:
+                        if not isinstance(source, dict):
+                            continue
+                        label = str(source.get("source_label", "")).upper()
+                        if not label:
+                            continue
+                        inherited_label = self._dependency_label(dep_id, label)
+                        registry_labels.append(inherited_label)
+                        registry.append(
+                            f"[{inherited_label}] {source.get('title', '')} "
+                            f"URL: {source.get('url') or source.get('pdf_url') or ''}"
+                        )
+                    registry_text = "\n".join(registry) or "（无可继承来源）"
+                    label_example = (
+                        registry_labels[0] if registry_labels else f"{dep_id}:SRC-1"
+                    )
+                    dep_parts.append(
+                        f"### 上游任务 {dep_id} 的结果:\n{namespaced_output}\n"
+                        f"#### 上游来源绑定:\n{registry_text}\n"
+                        f"引用该上游证据时必须保留完整标签，如 [{label_example}]。"
+                    )
                 else:
                     dep_parts.append(f"### 上游任务 {dep_id} 的结果:\n（暂不可用）")
         if dep_parts:

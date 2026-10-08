@@ -40,10 +40,16 @@ async def test_recall_from_knowledge_base(db_path: str) -> None:
     try:
         entry = KnowledgeEntry(
             id=KnowledgeBase.make_id(topic, task_description),
-            content="GPT-4o 于 2024 年 5 月发布，支持 128K 上下文。",
+            content="GPT-4o 于 2024 年 5 月发布，支持 128K 上下文 [SRC-1]。",
             task_type="search",
             topic=topic,
             confidence=0.85,
+            sources=[{
+                "source_label": "SRC-1",
+                "url": "https://example.com/gpt-4o",
+                "title": "GPT-4o announcement",
+                "snippet": "Released in May 2024.",
+            }],
             metadata={"task_description": task_description},
         )
         await kb.add(entry)
@@ -75,6 +81,7 @@ async def test_recall_from_knowledge_base(db_path: str) -> None:
         assert "2024 年 5 月发布" in result.output
         assert result.token_usage == 0
         assert result.confidence == 0.85
+        assert result.metadata["sources"] == entry.sources
     finally:
         await kb.close()
 
@@ -258,3 +265,207 @@ def test_each_loop_accepts_only_one_budget_eligible_tool_call() -> None:
     )
 
     assert [call["function"]["name"] for call in accepted] == ["web_search"]
+
+
+def test_source_labels_are_stable_and_attached_only_to_url_items() -> None:
+    labels: dict[str, str] = {}
+    first = [
+        {"title": "A", "url": "https://example.com/a"},
+        {"title": "No URL"},
+    ]
+    second = {
+        "results": [
+            {"title": "A again", "url": "https://example.com/a"},
+            {"title": "B", "url": "https://example.com/b"},
+        ]
+    }
+
+    ResearchAgent._attach_source_labels(first, labels)
+    ResearchAgent._attach_source_labels(second, labels)
+
+    assert first[0]["source_label"] == "SRC-1"
+    assert "source_label" not in first[1]
+    assert second["results"][0]["source_label"] == "SRC-1"
+    assert second["results"][1]["source_label"] == "SRC-2"
+
+
+def test_select_cited_sources_keeps_only_labels_used_by_output() -> None:
+    trajectory = [{
+        "role": "tool",
+        "result": [
+            {
+                "source_label": "SRC-1",
+                "url": "https://example.com/used",
+                "title": "Used",
+                "snippet": "evidence",
+            },
+            {
+                "source_label": "SRC-2",
+                "url": "https://example.com/unused",
+                "title": "Unused",
+                "snippet": "unused evidence",
+            },
+        ],
+    }]
+
+    sources = ResearchAgent._select_cited_sources(
+        "Only this claim is cited [SRC-1].", trajectory
+    )
+
+    assert sources == [{
+        "source_label": "SRC-1",
+        "url": "https://example.com/used",
+        "title": "Used",
+        "snippet": "evidence",
+    }]
+
+
+def test_available_sources_preserves_search_metadata_when_browser_result_is_empty() -> None:
+    trajectory = [
+        {
+            "role": "tool",
+            "result": [{
+                "source_label": "SRC-1",
+                "url": "https://example.com/article",
+                "title": "有效标题",
+                "snippet": "有效搜索摘要",
+            }],
+        },
+        {
+            "role": "tool",
+            "result": {
+                "results": [{
+                    "source_label": "SRC-1",
+                    "url": "https://example.com/article",
+                    "title": "å\u008d\u008eå°\u0094è¡\u0097è§\u0081é\u0097»",
+                    "content": "",
+                }],
+            },
+        },
+    ]
+
+    source = ResearchAgent._available_sources(trajectory)["SRC-1"]
+
+    assert source["title"] == "有效标题"
+    assert source["snippet"] == "有效搜索摘要"
+
+
+def test_prepare_result_normalizes_citation_before_persistence() -> None:
+    task = SubTask(id="t1", description="research", task_type="search")
+    trajectory = [{
+        "role": "tool",
+        "result": [{
+            "source_label": "SRC-13",
+            "url": "https://example.com/source",
+            "title": "Source",
+        }],
+    }]
+
+    output, metadata = ResearchAgent._prepare_result(
+        task,
+        "Supported finding [SRC-13 摘要]. Unknown [SRC-99 说明].",
+        trajectory,
+        from_memory=False,
+    )
+
+    assert output == "Supported finding [SRC-13]. Unknown [SRC-99]."
+    assert [source["source_label"] for source in metadata["sources"]] == ["SRC-13"]
+    assert metadata["citation_diagnostics"] == {
+        "normalized_count": 2,
+        "invalid_labels": ["SRC-99"],
+    }
+
+
+def test_prepare_result_inherits_namespaced_dependency_source() -> None:
+    task = SubTask(id="t2", description="analyze", task_type="analyze")
+    context = {
+        "dep:t1": "Upstream finding [SRC-3].",
+        "dep_sources:t1": [{
+            "source_label": "SRC-3",
+            "url": "https://example.com/upstream",
+            "title": "Upstream source",
+        }],
+    }
+
+    output, metadata = ResearchAgent._prepare_result(
+        task,
+        "Inherited finding [t1:SRC-3 摘要].",
+        [],
+        context,
+        from_memory=False,
+    )
+
+    assert output == "Inherited finding [T1:SRC-3]."
+    assert metadata["sources"] == [{
+        "source_label": "T1:SRC-3",
+        "url": "https://example.com/upstream",
+        "title": "Upstream source",
+        "snippet": "",
+    }]
+
+
+def test_task_prompt_namespaces_dependency_citations() -> None:
+    agent = ResearchAgent(name="researcher", policy=_DummyPolicy())
+    task = SubTask(
+        id="t2",
+        description="analyze",
+        task_type="analyze",
+        dependencies=["t1"],
+    )
+    context = {
+        "dep:t1": "Upstream finding [SRC-3 摘要].",
+        "dep_sources:t1": [{
+            "source_label": "SRC-3",
+            "url": "https://example.com/upstream",
+            "title": "Upstream source",
+        }],
+    }
+
+    prompt = agent._build_task_prompt(task, context)
+
+    assert "Upstream finding [T1:SRC-3]." in prompt
+    assert "[T1:SRC-3] Upstream source" in prompt
+
+
+def test_transitive_dependency_keeps_original_source_namespace() -> None:
+    agent = ResearchAgent(name="researcher", policy=_DummyPolicy())
+    task = SubTask(
+        id="task_7",
+        description="deeper analysis",
+        task_type="analyze",
+        dependencies=["task_5"],
+    )
+    context = {
+        "dep:task_5": "Transitive evidence [TASK_1:SRC-3]. Local [SRC-2].",
+        "dep_sources:task_5": [
+            {
+                "source_label": "TASK_1:SRC-3",
+                "url": "https://example.com/original",
+                "title": "Original task 1 source",
+            },
+            {
+                "source_label": "SRC-2",
+                "url": "https://example.com/task-5",
+                "title": "Task 5 source",
+            },
+        ],
+    }
+
+    prompt = agent._build_task_prompt(task, context)
+    output, metadata = ResearchAgent._prepare_result(
+        task,
+        "Use inherited [TASK_1:SRC-3] and direct [TASK_5:SRC-2].",
+        [],
+        context,
+        from_memory=False,
+    )
+
+    assert "[TASK_1:SRC-3] Original task 1 source" in prompt
+    assert "[TASK_5:SRC-2] Task 5 source" in prompt
+    assert "TASK_5:TASK_1" not in prompt
+    assert output == "Use inherited [TASK_1:SRC-3] and direct [TASK_5:SRC-2]."
+    assert [source["source_label"] for source in metadata["sources"]] == [
+        "TASK_1:SRC-3",
+        "TASK_5:SRC-2",
+    ]
+    assert metadata["citation_diagnostics"]["invalid_labels"] == []
