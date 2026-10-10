@@ -150,18 +150,21 @@ class RuleBasedMetrics:
     # 3. 引用覆盖率 / 来源充足度 (Source Adequacy)
     # -----------------------------------------------------------------------
     @staticmethod
-    def source_adequacy(report: str, num_sources: int = 0) -> float:
+    def source_adequacy(
+        report: str,
+        sources: list[dict[str, Any]] | None = None,
+    ) -> float:
         """
         评估报告的来源充分程度。
 
-        策略（同时使用两种信号）：
-        1. 正文内联引用：检测 [N]、【来源:】等标记的段落比例（权重 0.3）
-        2. 报告末尾的参考链接：检测 "参考链接"/"来源"/"References" 节中的 URL 数（权重 0.3）
-        3. 元数据来源数：num_sources 相对报告长度的密度（权重 0.4）
+        策略（只依赖正文和来源元数据）：
+        1. 有效引用段落覆盖率：含有在 sources 中存在的 [N] 的正文段落比例（0.5）
+        2. 引用编号有效率：有效 [N] 出现次数 / 全部 [N] 出现次数（0.2）
+        3. 实际引用来源密度：每千字符实际引用的去重来源数，1.5/千字满分（0.3）
 
         Args:
             report: 报告全文
-            num_sources: 从 agent 元数据中提取的去重来源数
+            sources: 报告的来源元数据，每项通常含 citation_id 和 URL
 
         Returns:
             0.0 ~ 1.0，越高表示来源越充分
@@ -169,36 +172,52 @@ class RuleBasedMetrics:
         if not report:
             return 0.0
 
-        score = 0.0
+        valid_ids: set[int] = set()
+        for index, source in enumerate(sources or [], 1):
+            try:
+                valid_ids.add(int(source.get("citation_id") or index))
+            except (TypeError, ValueError):
+                continue
 
-        # --- 信号 1：内联引用（权重 0.3）---
-        paragraphs = [p.strip() for p in report.split("\n") if p.strip()]
-        if paragraphs:
-            inline_patterns = [
-                r"\[\d+\]", r"\[来源[：:]", r"【来源[：:]", r"\(来源[：:]",
+        citation_pattern = re.compile(r"\[(\d+)\]")
+
+        # 参考链接由程序在交付时追加，不应当作正文引用参与评分。
+        body = re.split(
+            r"(?im)^\s{0,3}#{1,6}\s*(?:引用来源|参考来源|参考文献|参考链接|references|bibliography|sources)\s*$",
+            report,
+            maxsplit=1,
+        )[0]
+        paragraphs = [
+            line.strip()
+            for line in body.splitlines()
+            if len(line.strip()) >= 40 and not line.lstrip().startswith("#")
+        ]
+
+        def valid_citations(text: str) -> list[int]:
+            return [
+                int(match)
+                for match in citation_pattern.findall(text)
+                if int(match) in valid_ids
             ]
-            cited = sum(
-                1 for p in paragraphs
-                if any(re.search(pat, p) for pat in inline_patterns)
-            )
-            score += 0.3 * (cited / len(paragraphs))
 
-        # --- 信号 2：报告末尾的参考/来源节中的链接（权重 0.3）---
-        # 找报告后 30% 的部分（参考节通常在这里）
-        tail_start = int(len(report) * 0.7)
-        tail = report[tail_start:]
-        urls_in_tail = len(re.findall(r"https?://[^\s\)\]]+", tail))
-        # 期望至少 5 个链接算满分
-        score += 0.3 * min(1.0, urls_in_tail / 5.0)
+        cited_paragraphs = sum(1 for paragraph in paragraphs if valid_citations(paragraph))
+        coverage_score = cited_paragraphs / len(paragraphs) if paragraphs else 0.0
 
-        # --- 信号 3：元数据来源密度（权重 0.4）---
-        if num_sources > 0:
-            # 每 1000 字符 1 个来源 = 基准；2 个来源/千字 = 满分
-            report_kchars = max(len(report) / 1000.0, 0.5)
-            density = num_sources / report_kchars
-            score += 0.4 * min(1.0, density / 2.0)
+        all_citations = [int(match) for match in citation_pattern.findall(body)]
+        valid_occurrences = [citation for citation in all_citations if citation in valid_ids]
+        validity_score = (
+            len(valid_occurrences) / len(all_citations) if all_citations else 0.0
+        )
 
-        return min(1.0, score)
+        unique_cited_sources = len(set(valid_occurrences))
+        body_kchars = max(len(body) / 1000.0, 0.5)
+        cited_source_density = unique_cited_sources / body_kchars
+        density_score = min(1.0, cited_source_density / 1.5)
+
+        return min(
+            1.0,
+            0.5 * coverage_score + 0.2 * validity_score + 0.3 * density_score,
+        )
 
     # -----------------------------------------------------------------------
     # 4. 逻辑一致性 (Logical Consistency)
@@ -347,7 +366,8 @@ if __name__ == "__main__":
     halluc = RuleBasedMetrics.hallucination_rate(sample_report)
     print(f"幻觉率:                 {halluc:.3f}")
 
-    sa = RuleBasedMetrics.source_adequacy(sample_report, num_sources=4)
+    sample_sources = [{"citation_id": i} for i in range(1, 5)]
+    sa = RuleBasedMetrics.source_adequacy(sample_report, sources=sample_sources)
     print(f"来源充分度:             {sa:.3f}")
 
     logic = RuleBasedMetrics.logical_consistency(sample_report)

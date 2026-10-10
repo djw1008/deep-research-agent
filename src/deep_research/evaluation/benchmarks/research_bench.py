@@ -448,7 +448,7 @@ class ResearchBench:
         report: str,
         question_id: str,
         metrics_weights: dict[str, float] | None = None,
-        num_sources: int = 0,
+        sources: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         """
         对单篇研究报告进行评测。
@@ -457,7 +457,7 @@ class ResearchBench:
             report: 生成的研究报告文本。
             question_id: 对应题目的 ID。
             metrics_weights: 自定义指标权重。
-            num_sources: 从 agent 元数据中提取的去重来源数（用于 source_adequacy）。
+            sources: 报告的来源元数据（用于校验正文引用和 source_adequacy）。
 
         Returns:
             包含各维度得分和综合得分的字典。
@@ -474,7 +474,7 @@ class ResearchBench:
         factual_str = RuleBasedMetrics.fact_accuracy(report, ground_truth)
         factual_sem = RuleBasedMetrics.semantic_fact_accuracy(report, ground_truth, threshold=0.65)
         hallucination = RuleBasedMetrics.hallucination_rate(report)
-        source_adequacy = RuleBasedMetrics.source_adequacy(report, num_sources)
+        source_adequacy = RuleBasedMetrics.source_adequacy(report, sources)
         logic = RuleBasedMetrics.logical_consistency(report)
         comprehensive = RuleBasedMetrics.comprehensiveness(report, expected_topics)
 
@@ -518,7 +518,7 @@ class ResearchBench:
         for item in results:
             qid = item["question_id"]
             report = item["report"]
-            eval_result = self.evaluate_report(report, qid)
+            eval_result = self.evaluate_report(report, qid, sources=item.get("sources"))
             all_scores.append(eval_result)
 
             domain = eval_result["domain"]
